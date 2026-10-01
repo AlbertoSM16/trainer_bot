@@ -4,21 +4,76 @@ Bot de Telegram que gestiona un plan de **24 semanas** combinando gimnasio, carr
 
 ## Puesta en marcha
 
+Requisitos (Linux): Python 3.10 o superior con `venv` y `git`. En Debian/Ubuntu:
+
+```bash
+sudo apt install python3 python3-venv git
+```
+
 1. **Crea el bot en Telegram**: habla con [@BotFather](https://t.me/BotFather), envía `/newbot` y copia el token.
-2. **Configura el entorno**:
+2. **Descarga el código**:
+   ```bash
+   git clone https://github.com/AlbertoSM16/trainer_bot.git coach_bot
+   cd coach_bot
+   ```
+3. **Configura el entorno**:
    ```bash
    cp .env.example .env
    # edita .env y pega tu TELEGRAM_TOKEN
    ```
-3. **Instala dependencias**:
+4. **Crea el entorno virtual e instala dependencias**:
    ```bash
+   python3 -m venv .venv
    .venv/bin/pip install -r requirements.txt
    ```
-4. **Arranca**:
+5. **Arranca**:
    ```bash
    .venv/bin/python bot.py
    ```
-5. En Telegram, busca tu bot y envía `/start`.
+   Se para con `Ctrl+C`.
+6. En Telegram, busca tu bot y envía `/start`.
+
+### Dejarlo corriendo en Linux (systemd)
+
+Para que el bot siga funcionando al cerrar la terminal y arranque solo al encender el equipo, créalo como servicio de usuario (no hace falta `sudo`).
+
+1. Crea `~/.config/systemd/user/coach-bot.service` (con `mkdir -p ~/.config/systemd/user` si la carpeta no existe), cambiando la ruta por la carpeta donde está el bot:
+   ```ini
+   [Unit]
+   Description=Bot de entrenamiento (Telegram)
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   WorkingDirectory=%h/coach_bot
+   ExecStart=%h/coach_bot/.venv/bin/python bot.py
+   Restart=on-failure
+   RestartSec=10
+
+   [Install]
+   WantedBy=default.target
+   ```
+   `%h` es tu carpeta personal. `.env`, `entrenos.db` y `notion_dbs.json` se leen desde `WorkingDirectory`.
+2. Actívalo y arráncalo:
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user enable --now coach-bot
+   ```
+3. Permite que arranque aunque no hayas iniciado sesión:
+   ```bash
+   loginctl enable-linger $USER
+   ```
+
+Uso habitual:
+
+```bash
+systemctl --user status coach-bot     # estado
+journalctl --user -u coach-bot -f     # logs en vivo
+systemctl --user restart coach-bot    # tras cambiar código o .env
+systemctl --user stop coach-bot       # pararlo
+```
+
+> ⚠️ No lances `bot.py` a mano mientras el servicio está activo: Telegram rechaza dos procesos con el mismo token (error `Conflict`).
 
 ## Comandos
 
