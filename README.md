@@ -34,12 +34,53 @@ Bot de Telegram que gestiona un plan de **24 semanas** combinando gimnasio, carr
 | `/peso 78.4` | Registra tu peso |
 | `/grasa 12.5` | Registra tu % de grasa corporal |
 | `/stats` | Progreso de métricas y adherencia semanal |
+| `/dieta [mañana]` | Kcal y macros del día según el entreno |
+| `/menu [mañana]` | Qué comer en cada comida, en gramos, con whey y creatina |
+| `/compra` | Lista de la compra de Mercadona para los próximos 7 días |
 | `/faltan` | Cuenta atrás para la carrera |
 | `/notion` | Estado de la sincronización con Notion |
 | `/recordatorio on\|off` | Aviso diario automático |
 | `/perfil` | Tus datos actuales |
 
-Cada mañana a las 07:30 (configurable) el bot te envía el entreno del día.
+Cada mañana a las 07:30 (configurable) el bot te envía el entreno y el menú del día, y los sábados a las 08:30 la lista de la compra.
+
+## 🥗 Dieta y compra en Mercadona
+
+Objetivo: **volumen limpio**, ganando unos 0,25 kg por semana sin acumular grasa.
+
+- **Kcal diarias** = metabolismo basal (Mifflin-St Jeor) × 1,35 + gasto del entreno de ese día (sale del plan: minutos, km, gimnasio, descargas) + superávit (250 kcal) + ajuste automático.
+- **Macros**: proteína 2 g/kg, grasa 0,9 g/kg y el resto hidratos. Los días de tirada larga o calidad suben los hidratos.
+- **Ajuste automático**: cada sábado se mira la evolución de `/peso` en las últimas 2 semanas. Si subes menos de lo previsto se añaden 100 kcal, y si subes demasiado se quitan 100 (limitado entre −300 y +500). Para que funcione, pésate al menos 2-3 veces por semana.
+- **Menú diario** (`/menu`): reparte los alimentos en desayuno, comida (táper), merienda/post-entreno y cena, con los gramos en crudo de cada uno.
+  - La proteína y el hidrato de la comida y la cena rotan por día de la semana (pollo, pavo, atún, merluza, legumbres; arroz, pasta, patata).
+  - Cada plato principal lleva al menos 30 g de proteína, así que la proteína suele quedar algo por encima de 2 g/kg. Para no pasarte de kcal, se quitan hidratos.
+- **Suplementos de HSN**: la whey (1 cacito de 30 g en la merienda o después de entrenar) cuenta para los macros y reduce la proteína que tiene que venir de la comida. La creatina (5 g al día, también los días de descanso) aparece en el menú como recordatorio. Ninguno de los dos entra en la lista de Mercadona. Los macros de la whey (Evowhey) son valores medios y están en `alimentos.py`.
+- **Lista de la compra**: suma los menús de los 7 días y busca el producto más barato que encaja en la [API no oficial de Mercadona](https://tienda.mercadona.es) (almacén de tu código postal). Si se pasa del presupuesto, cambia proteínas caras por otras más baratas (huevos, contramuslos, atún, legumbres).
+  - Los productos frescos se cuentan por envases enteros.
+  - Los de despensa (arroz, pasta, aceite, frutos secos…) solo cuentan lo que gastas en la semana. Revisa lo que te queda antes de comprarlos.
+- Los precios se guardan en SQLite durante 6 días. Si Mercadona no responde, se usa la caché, y si no hay caché, la lista sale sin precios.
+
+Configuración en `.env`:
+
+| Variable | Por defecto | Descripción |
+|---|---|---|
+| `MERCADONA_WH` | `2183` | Almacén (sale de tu código postal) |
+| `PRESUPUESTO_SEMANAL` | `55` | Euros por semana |
+| `SUPERAVIT_KCAL` | `250` | Superávit diario de partida |
+| `OBJETIVO_KG_SEMANA` | `0.25` | Ganancia de peso buscada |
+| `COMPRA_HOUR` / `COMPRA_MINUTE` | `8` / `30` | Hora del aviso del sábado |
+| `WHEY_GRAMOS` | `30` | Whey de HSN al día (0 si no tomas) |
+| `CREATINA_GRAMOS` | `5` | Creatina al día (0 si no tomas) |
+| `ALIMENTOS_EXCLUIDOS` | brócoli, col… | Palabras separadas por comas que nunca entran en la lista |
+
+Para sacar el almacén de otro código postal:
+
+```bash
+curl -si -X PUT https://tienda.mercadona.es/api/postal-codes/actions/change-pc/ \
+  -H 'Content-Type: application/json' -d '{"new_postal_code":"18002"}' | grep -i x-customer-wh
+```
+
+> La API de Mercadona no es oficial y puede cambiar. Los macros de cada alimento son valores de referencia (en `alimentos.py`), no los de la etiqueta del producto concreto.
 
 ## 📓 Notion (opcional)
 
@@ -121,14 +162,21 @@ El gimnasio alterna rutinas **A** y **B** cada semana para variar estímulos.
 - **Sesiones de carrera, natación y bici**: la lista `WEEKS` en `plan.py`.
 - **Estructura de los días de la semana**: función `sesiones_dia()` en `plan.py`.
 - **Perfil y ritmo objetivo**: `config.py`.
+- **Alimentos, cantidades base y variantes de ahorro**: `alimentos.py`.
+- **Presupuesto, superávit y alimentos excluidos**: `.env`.
 
 ## Archivos
 
 ```
-bot.py          Handlers de Telegram y aviso diario
+bot.py          Handlers de Telegram, aviso diario y aviso de compra
 plan.py         Plan de 24 semanas y montaje de cada día
 gym.py          Rutinas de gimnasio A/B por grupo muscular
-db.py           Persistencia SQLite (métricas y entrenos)
+nutricion.py    Kcal y macros por día según el entreno; ajuste por peso
+menu.py         Menú diario por comidas (gramos de cada alimento)
+alimentos.py    Catálogo de alimentos (macros y cómo buscarlos en Mercadona)
+mercadona.py    Cliente de la API de Mercadona con caché en SQLite
+compra.py       Cálculo de cantidades y lista de la compra con presupuesto
+db.py           Persistencia SQLite (métricas, entrenos, ajuste y caché)
 notion_sync.py  Espejo en Notion
 config.py       Configuración y perfil
 ```

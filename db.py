@@ -27,6 +27,27 @@ CREATE TABLE IF NOT EXISTS entrenos (
     nota     TEXT,
     UNIQUE(chat_id, fecha)
 );
+CREATE TABLE IF NOT EXISTS mercadona_productos (
+    id          TEXT NOT NULL,
+    categoria   INTEGER NOT NULL,
+    nombre      TEXT NOT NULL,
+    precio      REAL,
+    tam         REAL,
+    formato     TEXT,
+    precio_ref  REAL,
+    formato_ref TEXT,
+    url         TEXT,
+    PRIMARY KEY (id, categoria)
+);
+CREATE TABLE IF NOT EXISTS mercadona_categorias (
+    id          INTEGER PRIMARY KEY,
+    actualizado TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS nutricion_ajuste (
+    chat_id     INTEGER PRIMARY KEY,
+    kcal        INTEGER NOT NULL DEFAULT 0,
+    actualizado TEXT
+);
 """
 
 
@@ -107,3 +128,69 @@ def total_entrenos(chat_id: int) -> int:
     with conn() as c:
         return c.execute("SELECT COUNT(*) n FROM entrenos WHERE chat_id = ?",
                          (chat_id,)).fetchone()["n"]
+
+
+# ---------- dieta ----------
+
+def ultimo_peso(chat_id: int) -> float | None:
+    with conn() as c:
+        fila = c.execute(
+            "SELECT peso FROM metricas WHERE chat_id = ? AND peso IS NOT NULL "
+            "ORDER BY fecha DESC LIMIT 1", (chat_id,)).fetchone()
+        return fila["peso"] if fila else None
+
+
+def pesos_desde(chat_id: int, desde: date) -> list[tuple[date, float]]:
+    with conn() as c:
+        return [(date.fromisoformat(r["fecha"]), r["peso"]) for r in c.execute(
+            "SELECT fecha, peso FROM metricas WHERE chat_id = ? AND peso IS NOT NULL "
+            "AND fecha >= ? ORDER BY fecha", (chat_id, desde.isoformat()))]
+
+
+def ajuste_kcal(chat_id: int) -> tuple[int, str | None]:
+    """Ajuste calórico acumulado y fecha de la última actualización."""
+    with conn() as c:
+        fila = c.execute("SELECT kcal, actualizado FROM nutricion_ajuste WHERE chat_id = ?",
+                         (chat_id,)).fetchone()
+        return (fila["kcal"], fila["actualizado"]) if fila else (0, None)
+
+
+def guardar_ajuste_kcal(chat_id: int, kcal: int, fecha: date):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO nutricion_ajuste (chat_id, kcal, actualizado) VALUES (?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET kcal = excluded.kcal, actualizado = excluded.actualizado",
+            (chat_id, kcal, fecha.isoformat()))
+
+
+# ---------- caché de Mercadona ----------
+
+def categoria_actualizada(categoria: int) -> str | None:
+    with conn() as c:
+        fila = c.execute("SELECT actualizado FROM mercadona_categorias WHERE id = ?",
+                         (categoria,)).fetchone()
+        return fila["actualizado"] if fila else None
+
+
+def guardar_categoria(categoria: int, productos: list[dict], cuando: str):
+    """Sustituye los productos guardados de una categoría por los recién descargados."""
+    with conn() as c:
+        c.execute("DELETE FROM mercadona_productos WHERE categoria = ?", (categoria,))
+        c.executemany(
+            "INSERT OR REPLACE INTO mercadona_productos "
+            "(id, categoria, nombre, precio, tam, formato, precio_ref, formato_ref, url) "
+            "VALUES (:id, :categoria, :nombre, :precio, :tam, :formato, :precio_ref, :formato_ref, :url)",
+            [{**p, "categoria": categoria} for p in productos])
+        c.execute(
+            "INSERT INTO mercadona_categorias (id, actualizado) VALUES (?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET actualizado = excluded.actualizado",
+            (categoria, cuando))
+
+
+def productos_en(categorias: list[int]) -> list[sqlite3.Row]:
+    if not categorias:
+        return []
+    marcas = ",".join("?" * len(categorias))
+    with conn() as c:
+        return list(c.execute(
+            f"SELECT * FROM mercadona_productos WHERE categoria IN ({marcas})", categorias))

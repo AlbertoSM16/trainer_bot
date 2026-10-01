@@ -7,12 +7,17 @@ from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+import alimentos
+import compra
 import db
 import gym
+import menu
+import mercadona
 import notion_sync
+import nutricion
 import plan
-from config import (ATHLETE, RACE_DATE, RACE_NAME, REMINDER_HOUR,
-                    REMINDER_MINUTE, TELEGRAM_TOKEN, TIMEZONE)
+from config import (ATHLETE, COMPRA_HOUR, COMPRA_MINUTE, RACE_DATE, RACE_NAME,
+                    REMINDER_HOUR, REMINDER_MINUTE, TELEGRAM_TOKEN, TIMEZONE)
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                     level=logging.INFO)
@@ -36,6 +41,11 @@ AYUDA = """🤖 *Tu entrenador personal*
 /peso `78.4` — registra tu peso
 /grasa `12.5` — registra tu % de grasa
 /stats — progreso y adherencia
+
+*Dieta*
+/dieta `[mañana]` — kcal y macros del día según tu entreno
+/menu `[mañana]` — qué comer y cuánto en cada comida (con whey y creatina)
+/compra — lista de la compra de Mercadona para 7 días
 
 *Otros*
 /faltan — cuenta atrás para la carrera
@@ -309,8 +319,86 @@ async def aviso_diario(ctx: ContextTypes.DEFAULT_TYPE):
     for chat_id in db.usuarios_con_recordatorio():
         try:
             await ctx.bot.send_message(chat_id, "☀️ *Entreno de hoy*\n\n" + texto, parse_mode=MD)
+            await ctx.bot.send_message(chat_id, _menu(chat_id, _hoy()), parse_mode=MD)
         except Exception as e:  # noqa: BLE001
             log.warning("No se pudo enviar a %s: %s", chat_id, e)
+
+
+# ---------- dieta ----------
+
+def _peso_actual(chat_id: int) -> float:
+    return db.ultimo_peso(chat_id) or ATHLETE["peso_inicial_kg"]
+
+
+def _dia_pedido(ctx: ContextTypes.DEFAULT_TYPE) -> date:
+    d = _hoy()
+    if ctx.args and alimentos.normalizar(ctx.args[0]) == "manana":
+        d += timedelta(days=1)
+    return d
+
+
+def _menu(chat_id: int, d: date) -> str:
+    """Menú del día con la misma variante de proteína que la lista de la compra de esa
+    semana (de sábado a viernes), calculada con los precios en caché."""
+    ajuste, _ = db.ajuste_kcal(chat_id)
+    peso = _peso_actual(chat_id)
+    sabado = d - timedelta(days=(d.weekday() - 5) % 7)
+    opciones = {k: mercadona.candidatos(a) for k, a in alimentos.disponibles().items()}
+    variante = compra.construir(nutricion.objetivos_semana(sabado, peso, ajuste), opciones).variante
+    return menu.formatear(menu.menu_dia(nutricion.objetivo_dia(d, peso, ajuste), variante))
+
+
+async def menu_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    db.alta_usuario(chat_id, update.effective_user.first_name or "atleta")
+    await update.message.reply_text(_menu(chat_id, _dia_pedido(ctx)), parse_mode=MD)
+
+
+async def dieta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    d = _dia_pedido(ctx)
+    chat_id = update.effective_chat.id
+    ajuste, _ = db.ajuste_kcal(chat_id)
+    o = nutricion.objetivo_dia(d, _peso_actual(chat_id), ajuste)
+    await update.message.reply_text(nutricion.formatear_objetivo(o) + "\n\n🍽️ Qué comer: /menu",
+                                    parse_mode=MD)
+
+
+async def _lista_compra(chat_id: int) -> str:
+    await mercadona.actualizar()
+    ajuste, _ = db.ajuste_kcal(chat_id)
+    objetivos = nutricion.objetivos_semana(_hoy(), _peso_actual(chat_id), ajuste)
+    opciones = {k: mercadona.candidatos(a) for k, a in alimentos.disponibles().items()}
+    return compra.formatear(compra.construir(objetivos, opciones))
+
+
+async def lista_compra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    db.alta_usuario(chat_id, update.effective_user.first_name or "atleta")
+    await update.message.reply_text("🛒 Consultando precios de Mercadona…")
+    await update.message.reply_text(await _lista_compra(chat_id), parse_mode=MD,
+                                    disable_web_page_preview=True)
+
+
+def _ajuste_semanal(chat_id: int) -> str:
+    """Recalcula el ajuste de kcal según la evolución del peso (como mucho una vez al día)."""
+    hoy_d = _hoy()
+    actual, fecha = db.ajuste_kcal(chat_id)
+    if fecha == hoy_d.isoformat():
+        return ""
+    pesos = db.pesos_desde(chat_id, hoy_d - timedelta(days=14))
+    nuevo, motivo = nutricion.nuevo_ajuste(pesos, hoy_d, actual)
+    db.guardar_ajuste_kcal(chat_id, nuevo, hoy_d)
+    return f"⚖️ {motivo}\n\n"
+
+
+async def aviso_compra(ctx: ContextTypes.DEFAULT_TYPE):
+    for chat_id in db.usuarios_con_recordatorio():
+        try:
+            texto = _ajuste_semanal(chat_id) + await _lista_compra(chat_id)
+            await ctx.bot.send_message(chat_id, "🛍️ *¡Sábado de compra!*\n\n" + texto,
+                                       parse_mode=MD, disable_web_page_preview=True)
+        except Exception as e:  # noqa: BLE001
+            log.warning("No se pudo enviar la compra a %s: %s", chat_id, e)
 
 
 async def post_init(app: Application):
@@ -334,6 +422,9 @@ async def post_init(app: Application):
         BotCommand("peso", "Registrar peso"),
         BotCommand("grasa", "Registrar % de grasa"),
         BotCommand("stats", "Progreso y adherencia"),
+        BotCommand("dieta", "Kcal y macros de hoy"),
+        BotCommand("menu", "Qué comer hoy y cuánto"),
+        BotCommand("compra", "Lista de la compra de Mercadona"),
         BotCommand("faltan", "Cuenta atrás para la carrera"),
         BotCommand("notion", "Estado de la sincronización con Notion"),
         BotCommand("recordatorio", "Activar/desactivar aviso diario"),
@@ -355,6 +446,7 @@ def main():
         "ritmos": ritmos, "fases": fases, "peso": peso, "grasa": grasa,
         "stats": stats, "hecho": hecho, "faltan": faltan, "perfil": perfil,
         "recordatorio": recordatorio, "notion": notion,
+        "dieta": dieta, "menu": menu_cmd, "compra": lista_compra,
     }
     for nombre, fn in handlers.items():
         app.add_handler(CommandHandler(nombre, fn))
@@ -364,6 +456,13 @@ def main():
             aviso_diario,
             time=time(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, tzinfo=TZ),
             name="aviso_diario",
+        )
+        # En PTB los días van de 0 = domingo a 6 = sábado
+        app.job_queue.run_daily(
+            aviso_compra,
+            time=time(hour=COMPRA_HOUR, minute=COMPRA_MINUTE, tzinfo=TZ),
+            days=(6,),
+            name="aviso_compra",
         )
     log.info("Bot en marcha. Plan de %s semanas.", plan.total_semanas())
     app.run_polling(allowed_updates=Update.ALL_TYPES)
