@@ -36,6 +36,12 @@ AYUDA = """🤖 *Tu entrenador personal*
 /ritmos — tabla de ritmos y zonas
 /fases — estructura del plan completo
 
+*Cambios en tu semana*
+/mover `jueves viernes` — intercambia dos días (o recupera uno saltado)
+/saltar `[día]` — hoy (o ese día) descansas
+/cambiar `corta|bici|natacion [día]` — versión corta o alternativa sin impacto
+/deshacer `[día|semana]` — quita los cambios
+
 *Seguimiento*
 /hecho `[nota]` — marca el entreno de hoy como completado
 /peso `78.4` — registra tu peso
@@ -59,6 +65,18 @@ def _hoy() -> date:
     return datetime.now(TZ).date()
 
 
+def _cambios(chat_id: int, desde: date, hasta: date) -> dict[date, plan.Cambio]:
+    return {d: plan.Cambio(o, m) for d, (o, m) in db.cambios_entre(chat_id, desde, hasta).items()}
+
+
+def _cambio(chat_id: int, d: date) -> plan.Cambio | None:
+    return _cambios(chat_id, d, d).get(d)
+
+
+def _lunes(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     db.alta_usuario(update.effective_chat.id, u.first_name or "atleta")
@@ -79,12 +97,15 @@ async def ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def hoy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(plan.formatear_dia(_hoy()), parse_mode=MD)
+    d = _hoy()
+    await update.message.reply_text(
+        plan.formatear_dia(d, _cambio(update.effective_chat.id, d)), parse_mode=MD)
 
 
 async def manana(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(plan.formatear_dia(_hoy() + timedelta(days=1)),
-                                    parse_mode=MD)
+    d = _hoy() + timedelta(days=1)
+    await update.message.reply_text(
+        plan.formatear_dia(d, _cambio(update.effective_chat.id, d)), parse_mode=MD)
 
 
 async def semana(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -95,7 +116,9 @@ async def semana(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Usa `/semana 7` con el número de semana.", parse_mode=MD)
             return
-    await update.message.reply_text(plan.resumen_semana(wn), parse_mode=MD)
+    lunes = plan.fecha_lunes(wn)
+    cambios = _cambios(update.effective_chat.id, lunes, lunes + timedelta(days=6))
+    await update.message.reply_text(plan.resumen_semana(wn, cambios), parse_mode=MD)
 
 
 async def gimnasio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -104,8 +127,11 @@ async def gimnasio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if plan.datos_semana(wn) is None:
         await update.message.reply_text("Hoy estás fuera del plan.")
         return
+    c = _cambio(update.effective_chat.id, d)
     grupos = {0: "pierna", 1: "pecho", 2: "espalda", 3: "hombro"}
-    grupo = grupos.get(d.weekday())
+    grupo = None
+    if wn != plan.total_semanas() and (c is None or c.modo in (None, "corta")):
+        grupo = grupos.get((c.origen if c else d).weekday())
     if not grupo:
         await update.message.reply_text(
             "Hoy no toca gimnasio. Usa /hoy para ver la sesión que te corresponde.")
@@ -210,11 +236,16 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def hecho(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = _hoy()
-    s = plan.sesiones_dia(d)
+    c = _cambio(update.effective_chat.id, d)
+    s = plan.sesiones_dia(d, c)
     if s["fuera_de_plan"]:
         await update.message.reply_text(
             "Hoy no hay sesión planificada todavía. El plan arranca el "
             f"{plan.PLAN_START.strftime('%d/%m/%Y')}.")
+        return
+    if c and c.modo == "descanso":
+        await update.message.reply_text(
+            "Hoy tienes descanso 😴. Si al final entrenas, usa /deshacer y luego /hecho.")
         return
     chat_id = update.effective_chat.id
     db.alta_usuario(chat_id, update.effective_user.first_name or "atleta")
@@ -227,7 +258,7 @@ async def hecho(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         semana=s["semana"],
         fase=plan.fase_nombre_corto(s["fase"]),
         dia=plan.DIAS[d.weekday()],
-        tipos=plan.tipos_dia(d),
+        tipos=plan.tipos_dia(d, c),
         descarga=bool(s.get("descarga")),
     )
     msg = f"✅ Anotado: *{s['titulo']}*"
@@ -315,13 +346,162 @@ async def recordatorio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def aviso_diario(ctx: ContextTypes.DEFAULT_TYPE):
-    texto = plan.formatear_dia(_hoy())
+    d = _hoy()
     for chat_id in db.usuarios_con_recordatorio():
         try:
+            texto = plan.formatear_dia(d, _cambio(chat_id, d))
             await ctx.bot.send_message(chat_id, "☀️ *Entreno de hoy*\n\n" + texto, parse_mode=MD)
             await ctx.bot.send_message(chat_id, _menu(chat_id, _hoy()), parse_mode=MD)
         except Exception as e:  # noqa: BLE001
             log.warning("No se pudo enviar a %s: %s", chat_id, e)
+
+
+# ---------- cambios en la semana ----------
+
+_DIAS_NORM = {alimentos.normalizar(n): i for i, n in enumerate(plan.DIAS)}
+_CLAVE = {"larga": "tirada larga", "calidad": "sesión de calidad"}
+
+
+def _parse_dia(texto: str) -> date | None:
+    t, h = alimentos.normalizar(texto), _hoy()
+    if t == "hoy":
+        return h
+    if t == "manana":
+        return h + timedelta(days=1)
+    if t in _DIAS_NORM:
+        return _lunes(h) + timedelta(days=_DIAS_NORM[t])
+    return None
+
+
+def _error_dia(d: date | None) -> str | None:
+    if d is None:
+        return "No entiendo el día. Usa `hoy`, `mañana` o un día de esta semana (`lunes`…`domingo`)."
+    if d < _hoy():
+        return "Ese día ya ha pasado: solo puedo cambiar de hoy en adelante."
+    if plan.datos_semana(plan.semana_indice(d)) is None:
+        return "Ese día está fuera del plan."
+    if plan.es_dia_carrera(d):
+        return "El día de la carrera no se toca 🏁"
+    return None
+
+
+def _nombre(d: date) -> str:
+    return plan.DIAS[d.weekday()]
+
+
+def _guardar(chat_id: int, nuevos: dict[date, plan.Cambio | None]):
+    db.guardar_cambios(chat_id, {d: (c.origen, c.modo) if c else None for d, c in nuevos.items()})
+
+
+def _cambios_semana(chat_id: int, d: date) -> dict[date, plan.Cambio]:
+    return _cambios(chat_id, _lunes(d), _lunes(d) + timedelta(days=6))
+
+
+def _resultado(chat_id: int, dias: list[date]) -> str:
+    cambios = _cambios_semana(chat_id, dias[0])
+    out = [f"• *{_nombre(d)}*: {plan.sesiones_dia(d, cambios.get(d))['titulo']}"
+           for d in sorted(set(dias))]
+    avisos = plan.avisos_semana(_lunes(dias[0]), cambios)
+    if avisos:
+        out += [""] + [f"⚠️ {a}" for a in avisos]
+    return "\n".join(out)
+
+
+async def _responder_error(update: Update, error: str):
+    await update.message.reply_text(error, parse_mode=MD)
+
+
+async def mover(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) != 2:
+        await _responder_error(update, "Usa `/mover jueves viernes` (días de esta semana).")
+        return
+    a, b = (_parse_dia(x) for x in ctx.args)
+    error = _error_dia(a) or _error_dia(b)
+    if not error and a == b:
+        error = "Son el mismo día."
+    if not error and _lunes(a) != _lunes(b):
+        error = "Solo puedo mover sesiones dentro de la misma semana (de lunes a domingo)."
+    if error:
+        await _responder_error(update, error)
+        return
+    chat_id = update.effective_chat.id
+    db.alta_usuario(chat_id, update.effective_user.first_name or "atleta")
+    _guardar(chat_id, plan.mover(_cambios_semana(chat_id, a), a, b))
+    await update.message.reply_text("🔀 *Semana cambiada*\n\n" + _resultado(chat_id, [a, b]),
+                                    parse_mode=MD)
+
+
+async def saltar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    d = _parse_dia(ctx.args[0]) if ctx.args else _hoy()
+    error = _error_dia(d)
+    if error:
+        await _responder_error(update, error)
+        return
+    chat_id = update.effective_chat.id
+    db.alta_usuario(chat_id, update.effective_user.first_name or "atleta")
+    cambios = _cambios_semana(chat_id, d)
+    if plan.efectivo(cambios, d).modo == "descanso":
+        await update.message.reply_text(f"El {_nombre(d).lower()} ya es de descanso.")
+        return
+    clave = _CLAVE.get(plan.carga_dia(d, cambios))
+    _guardar(chat_id, plan.cambiar(cambios, d, "descanso"))
+    out = [f"⏭️ *{_nombre(d)}*: descanso."]
+    if clave:
+        hueco = plan.sugerir_recuperacion(_cambios_semana(chat_id, d), d, _hoy())
+        out.append(f"\nEra tu *{clave}*, la sesión más importante de la semana.")
+        if hueco:
+            out.append(f"💡 Puedes recuperarla el {_nombre(hueco).lower()}: "
+                       f"`/mover {_nombre(d).lower()} {_nombre(hueco).lower()}`")
+        else:
+            out.append("Esta semana no queda hueco sin sobrecargarte: mejor dejarla.")
+    await update.message.reply_text("\n".join(out), parse_mode=MD)
+
+
+async def cambiar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    modos = {"corta": "corta", "bici": "bici", "natacion": "natacion", "nadar": "natacion",
+             "descanso": "descanso", "normal": None}
+    modo = alimentos.normalizar(ctx.args[0]) if ctx.args else ""
+    if modo not in modos:
+        await _responder_error(update, "Usa `/cambiar corta`, `/cambiar bici` o "
+                                       "`/cambiar natacion` (y opcionalmente el día). "
+                                       "`/cambiar normal` vuelve a la sesión original.")
+        return
+    d = _parse_dia(ctx.args[1]) if len(ctx.args) > 1 else _hoy()
+    error = _error_dia(d)
+    if error:
+        await _responder_error(update, error)
+        return
+    chat_id = update.effective_chat.id
+    db.alta_usuario(chat_id, update.effective_user.first_name or "atleta")
+    _guardar(chat_id, plan.cambiar(_cambios_semana(chat_id, d), d, modos[modo]))
+    if d == _hoy():
+        await update.message.reply_text(plan.formatear_dia(d, _cambio(chat_id, d)), parse_mode=MD)
+    else:
+        await update.message.reply_text("✅ " + _resultado(chat_id, [d]), parse_mode=MD)
+
+
+async def deshacer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    arg = alimentos.normalizar(ctx.args[0]) if ctx.args else "hoy"
+    if arg == "semana":
+        cambios = _cambios_semana(chat_id, _hoy())
+        nuevos = {d: None for d in cambios if d >= _hoy()}
+        dias = list(nuevos)
+    else:
+        d = _parse_dia(arg)
+        error = _error_dia(d)
+        if error:
+            await _responder_error(update, error)
+            return
+        cambios = _cambios_semana(chat_id, d)
+        nuevos = plan.deshacer(cambios, d)
+        dias = list(nuevos)
+    if not nuevos:
+        await update.message.reply_text("No hay cambios que deshacer.")
+        return
+    _guardar(chat_id, nuevos)
+    await update.message.reply_text("↩️ *Plan original*\n\n" + _resultado(chat_id, dias),
+                                    parse_mode=MD)
 
 
 # ---------- dieta ----------
@@ -343,9 +523,11 @@ def _menu(chat_id: int, d: date) -> str:
     ajuste, _ = db.ajuste_kcal(chat_id)
     peso = _peso_actual(chat_id)
     sabado = d - timedelta(days=(d.weekday() - 5) % 7)
+    cambios = _cambios(chat_id, sabado, sabado + timedelta(days=6))
     opciones = {k: mercadona.candidatos(a) for k, a in alimentos.disponibles().items()}
-    variante = compra.construir(nutricion.objetivos_semana(sabado, peso, ajuste), opciones).variante
-    return menu.formatear(menu.menu_dia(nutricion.objetivo_dia(d, peso, ajuste), variante))
+    objetivos = nutricion.objetivos_semana(sabado, peso, ajuste, cambios)
+    variante = compra.construir(objetivos, opciones).variante
+    return menu.formatear(menu.menu_dia(objetivos[(d - sabado).days], variante))
 
 
 async def menu_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -358,7 +540,7 @@ async def dieta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = _dia_pedido(ctx)
     chat_id = update.effective_chat.id
     ajuste, _ = db.ajuste_kcal(chat_id)
-    o = nutricion.objetivo_dia(d, _peso_actual(chat_id), ajuste)
+    o = nutricion.objetivo_dia(d, _peso_actual(chat_id), ajuste, _cambio(chat_id, d))
     await update.message.reply_text(nutricion.formatear_objetivo(o) + "\n\n🍽️ Qué comer: /menu",
                                     parse_mode=MD)
 
@@ -366,7 +548,8 @@ async def dieta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _lista_compra(chat_id: int) -> str:
     await mercadona.actualizar()
     ajuste, _ = db.ajuste_kcal(chat_id)
-    objetivos = nutricion.objetivos_semana(_hoy(), _peso_actual(chat_id), ajuste)
+    cambios = _cambios(chat_id, _hoy(), _hoy() + timedelta(days=6))
+    objetivos = nutricion.objetivos_semana(_hoy(), _peso_actual(chat_id), ajuste, cambios)
     opciones = {k: mercadona.candidatos(a) for k, a in alimentos.disponibles().items()}
     return compra.formatear(compra.construir(objetivos, opciones))
 
@@ -418,6 +601,10 @@ async def post_init(app: Application):
         BotCommand("gym", "Rutina de gimnasio de hoy"),
         BotCommand("ritmos", "Ritmos y zonas de entrenamiento"),
         BotCommand("fases", "Plan completo por fases"),
+        BotCommand("mover", "Intercambiar dos días de esta semana"),
+        BotCommand("saltar", "Descansar hoy u otro día"),
+        BotCommand("cambiar", "Versión corta, bici o natación"),
+        BotCommand("deshacer", "Quitar cambios de la semana"),
         BotCommand("hecho", "Marcar entreno como completado"),
         BotCommand("peso", "Registrar peso"),
         BotCommand("grasa", "Registrar % de grasa"),
@@ -446,6 +633,7 @@ def main():
         "ritmos": ritmos, "fases": fases, "peso": peso, "grasa": grasa,
         "stats": stats, "hecho": hecho, "faltan": faltan, "perfil": perfil,
         "recordatorio": recordatorio, "notion": notion,
+        "mover": mover, "saltar": saltar, "cambiar": cambiar, "deshacer": deshacer,
         "dieta": dieta, "menu": menu_cmd, "compra": lista_compra,
     }
     for nombre, fn in handlers.items():

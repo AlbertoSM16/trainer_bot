@@ -30,6 +30,10 @@ Bot de Telegram que gestiona un plan de **24 semanas** combinando gimnasio, carr
 | `/gym` | Detalle de la rutina de gimnasio de hoy |
 | `/ritmos` | Tabla de ritmos y zonas (carrera, natación, bici) |
 | `/fases` | Estructura completa del plan |
+| `/mover jueves viernes` | Intercambia las sesiones de dos días de esta semana (o recupera una saltada) |
+| `/saltar [día]` | Ese día descansas (por defecto, hoy) |
+| `/cambiar corta\|bici\|natacion [día]` | Versión corta o alternativa sin impacto (`normal` la deja como estaba) |
+| `/deshacer [día\|semana]` | Quita los cambios |
 | `/hecho [nota]` | Marca el entreno de hoy como completado |
 | `/peso 78.4` | Registra tu peso |
 | `/grasa 12.5` | Registra tu % de grasa corporal |
@@ -44,6 +48,17 @@ Bot de Telegram que gestiona un plan de **24 semanas** combinando gimnasio, carr
 
 Cada mañana a las 07:30 (configurable) el bot te envía el entreno y el menú del día, y los sábados a las 08:30 la lista de la compra.
 
+## 🔀 Cambios en la semana
+
+Si te surge un plan, adapta la semana sin tocar el plan general:
+
+- `/mover sábado domingo` intercambia las sesiones de los dos días. Si el primer día está saltado, recupera su sesión en el segundo y sustituye la que hubiera.
+- `/saltar [día]` convierte el día en descanso. Si era la tirada larga o la sesión de calidad, te sugiere el día más ligero que queda para recuperarla.
+- `/cambiar corta [día]` deja la sesión a la mitad de volumen. `/cambiar bici` y `/cambiar natacion` la sustituyen por cardio sin impacto de duración parecida.
+- `/deshacer [día|semana]` vuelve al plan original. En un intercambio, deshace los dos días.
+
+Solo se pueden cambiar días de la semana en curso, de hoy en adelante, y el día de la carrera no se toca. El bot avisa si la semana queda mal montada: pierna justo antes de la tirada larga, series y tirada larga en días seguidos, o tres días duros seguidos. Las kcal, el menú y la lista de la compra se recalculan con la sesión que haces de verdad.
+
 ## 🥗 Dieta y compra en Mercadona
 
 Objetivo: **volumen limpio**, ganando unos 0,25 kg por semana sin acumular grasa.
@@ -51,13 +66,27 @@ Objetivo: **volumen limpio**, ganando unos 0,25 kg por semana sin acumular grasa
 - **Kcal diarias** = metabolismo basal (Mifflin-St Jeor) × 1,35 + gasto del entreno de ese día (sale del plan: minutos, km, gimnasio, descargas) + superávit (250 kcal) + ajuste automático.
 - **Macros**: proteína 2 g/kg, grasa 0,9 g/kg y el resto hidratos. Los días de tirada larga o calidad suben los hidratos.
 - **Ajuste automático**: cada sábado se mira la evolución de `/peso` en las últimas 2 semanas. Si subes menos de lo previsto se añaden 100 kcal, y si subes demasiado se quitan 100 (limitado entre −300 y +500). Para que funcione, pésate al menos 2-3 veces por semana.
-- **Menú diario** (`/menu`): reparte los alimentos en desayuno, comida (táper), merienda/post-entreno y cena, con los gramos en crudo de cada uno.
-  - La proteína y el hidrato de la comida y la cena rotan por día de la semana (pollo, pavo, atún, merluza, legumbres; arroz, pasta, patata).
-  - Cada plato principal lleva al menos 30 g de proteína, así que la proteína suele quedar algo por encima de 2 g/kg. Para no pasarte de kcal, se quitan hidratos.
+- **Menú diario** (`/menu`): un plato por comida (desayuno, comida/táper, merienda/post-entreno y cena), con los gramos en crudo de cada ingrediente. Se escalan la proteína y el hidrato de cada plato para cuadrar los macros; el resto de ingredientes van en cantidad fija.
+
+  | Día | Comida | Cena |
+  |---|---|---|
+  | Lunes | Ternera picada con pimientos y cebolla + arroz | Salmón en airfryer + patata + canónigos |
+  | Martes | Arroz frito con pollo, verduras, huevo y soja | Merluza en airfryer con calabacín + patata |
+  | Miércoles | Pollo a la plancha con pimientos + arroz | Solomillo de pavo + batata y pimientos |
+  | Jueves | Pasta en el trabajo (fuera) | Pota encebollada + arroz |
+  | Viernes | Macarrones con ternera y tomate | Cena fuera |
+  | Sábado | Fabada (semanas impares) o salchichas de pollo + batata | Empanada de atún, huevo y tomate |
+  | Domingo | Empanada (la otra mitad) | Pollo + ensalada de canónigos, aguacate y queso de cabra + arroz |
+
+  - Desayuno: tostadas con AOVE y pavo, o bol de queso batido/yogur con avena, miel y plátano, siempre con café con leche. Merienda: whey con tostada y crema de cacahuete, o yogur con whey, avena, nueces y fruta. La fruta del postre rota cada día.
+  - Las comidas fuera salen con las kcal y proteína aproximadas que te tocan; cuentan para el total del día pero no entran en la lista de la compra.
+  - Hay un tope de pan, avena, patata, arroz, etc. por plato; lo que no cabe pasa al arroz, la pasta o la patata del día.
+  - Cada plato con proteína lleva al menos 30 g, así que la proteína suele quedar algo por encima de 2 g/kg. Para no pasarte de kcal, se quitan hidratos.
+  - Para cambiar platos, edita `PLATOS` y `SEMANA` en `menu.py`.
 - **Suplementos de HSN**: la whey (1 cacito de 30 g en la merienda o después de entrenar) cuenta para los macros y reduce la proteína que tiene que venir de la comida. La creatina (5 g al día, también los días de descanso) aparece en el menú como recordatorio. Ninguno de los dos entra en la lista de Mercadona. Los macros de la whey (Evowhey) son valores medios y están en `alimentos.py`.
-- **Lista de la compra**: suma los menús de los 7 días y busca el producto más barato que encaja en la [API no oficial de Mercadona](https://tienda.mercadona.es) (almacén de tu código postal). Si se pasa del presupuesto, cambia proteínas caras por otras más baratas (huevos, contramuslos, atún, legumbres).
+- **Lista de la compra**: suma los menús de los 7 días y busca el producto más barato que encaja en la [API no oficial de Mercadona](https://tienda.mercadona.es) (almacén de tu código postal). Si se pasa del presupuesto, cambia primero el salmón por merluza y, si aún no entra, también la pota por merluza y la ternera por pollo.
   - Los productos frescos se cuentan por envases enteros.
-  - Los de despensa (arroz, pasta, aceite, frutos secos…) solo cuentan lo que gastas en la semana. Revisa lo que te queda antes de comprarlos.
+  - Los de despensa (arroz, pasta, aceite, frutos secos…) y el pescado congelado solo cuentan lo que gastas en la semana. Revisa lo que te queda antes de comprarlos.
 - Los precios se guardan en SQLite durante 6 días. Si Mercadona no responde, se usa la caché, y si no hay caché, la lista sale sin precios.
 
 Configuración en `.env`:
@@ -160,7 +189,7 @@ El gimnasio alterna rutinas **A** y **B** cada semana para variar estímulos.
 - **Fechas y horarios**: `.env` (`PLAN_START`, `RACE_DATE`, `REMINDER_HOUR`).
 - **Ejercicios de gimnasio**: `gym.py`.
 - **Sesiones de carrera, natación y bici**: la lista `WEEKS` en `plan.py`.
-- **Estructura de los días de la semana**: función `sesiones_dia()` en `plan.py`.
+- **Estructura de los días de la semana**: función `_sesion_base()` en `plan.py`.
 - **Perfil y ritmo objetivo**: `config.py`.
 - **Alimentos, cantidades base y variantes de ahorro**: `alimentos.py`.
 - **Presupuesto, superávit y alimentos excluidos**: `.env`.

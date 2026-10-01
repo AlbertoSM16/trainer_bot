@@ -34,58 +34,75 @@ class Alimento:
     alguna: tuple[str, ...] = ()        # debe aparecer al menos una
     excluye: tuple[str, ...] = ()
     gramos_unidad: float | None = None  # para productos vendidos por unidades (huevos)
-    duradero: bool = False              # despensa: no hace falta comprarlo cada semana
+    duradero: bool = False              # despensa o congelado: no hace falta comprarlo cada semana
 
 
 CATALOGO = {a.clave: a for a in [
-    # --- proteína ---
+    # --- carne y pescado ---
     Alimento("pollo_pechuga", "Pechuga de pollo", "proteina", 110, 23, 0, 1.5, (38,),
              ("pechuga", "pollo"),
              excluye=("marinad", "empanad", "lonchas", "braseada", "tiras", "hierbas", "certificado")),
-    Alimento("pollo_contramuslo", "Contramuslo de pollo sin piel", "proteina", 130, 19, 0, 6, (38,),
-             ("contramuslo", "pollo", "sin piel"), excluye=("certificado", "marinad")),
-    Alimento("pavo", "Pechuga de pavo", "proteina", 105, 24, 0, 1, (38,),
-             ("pechuga", "pavo"), excluye=("marinad", "lonchas", "empanad")),
+    Alimento("ternera_picada", "Ternera picada", "proteina", 165, 20, 0.5, 9, (44,),
+             ("preparado de carne picada vacuno",), excluye=("cerdo",)),
+    Alimento("pavo_solomillo", "Solomillo de pavo", "proteina", 107, 24, 0, 1.2, (38,),
+             ("solomillo", "pavo")),
+    Alimento("salchichas_pollo", "Salchichas de pollo", "proteina", 210, 12, 3, 17, (52,),
+             ("salchichas", "pollo"), excluye=("cerdo", "queso", "bocata")),
     Alimento("merluza", "Merluza congelada", "proteina", 75, 17, 0, 1, (34,),
              ("merluza",), alguna=("filetes", "porciones", "medallones", "lomos", "rodajas"),
-             excluye=("empanad", "rebozad", "romana", "al huevo", "langostino", "varitas", "palitos")),
+             excluye=("empanad", "rebozad", "romana", "al huevo", "langostino", "varitas", "palitos"),
+             duradero=True),
+    Alimento("salmon", "Salmón congelado", "proteina", 180, 20, 0, 11, (34,),
+             ("salmon",), alguna=("lomos", "filete", "medallones"),
+             excluye=("ahumado", "verduras", "poke"), duradero=True),
+    Alimento("pota", "Pota congelada", "proteina", 72, 15, 1, 1, (34,),
+             ("pota",), excluye=("romana", "rebozad"), duradero=True),
     Alimento("atun", "Atún al natural", "proteina", 110, 25, 0, 1, (122,),
              ("atun", "natural"), duradero=True),
     Alimento("huevos", "Huevos", "proteina", 143, 12.6, 0.7, 9.5, (77,),
              ("huevos",), excluye=("cocidos", "codorniz"), gramos_unidad=60),
-    Alimento("garbanzos", "Garbanzos cocidos", "despensa", 120, 7, 16, 2.5, (121,),
-             ("garbanzo", "cocido"), duradero=True),
-    Alimento("lentejas", "Lentejas cocidas", "despensa", 100, 8, 13, 0.5, (121,),
-             ("lenteja", "cocida"), duradero=True),
+    Alimento("pavo_lonchas", "Pechuga de pavo en lonchas", "proteina", 100, 18, 2, 2, (48,),
+             ("pechuga de pavo", "lonchas"), excluye=("cocida",)),
     # --- lácteos ---
     Alimento("leche", "Leche semidesnatada", "lacteos", 46, 3.2, 4.7, 1.6, (72,),
              ("leche semidesnatada",),
              excluye=("sin lactosa", "calcio", "cabra", "omega", "proteinas", "batido")),
     Alimento("queso_batido", "Queso fresco batido 0%", "lacteos", 46, 8, 3.4, 0.1, (53,),
              ("queso fresco batido", "0%")),
+    Alimento("yogur", "Yogur natural 0%", "lacteos", 40, 4.5, 5, 0.1, (103,),
+             ("yogur natural", "0%"), excluye=("edulcorado",)),
+    Alimento("queso_cabra", "Queso fresco de cabra", "lacteos", 200, 12, 1.5, 16, (53,),
+             ("queso fresco de cabra",)),
     # --- fruta ---
     Alimento("platano", "Plátano", "fruta", 60, 0.7, 14, 0.2, (27,),
              (), alguna=("platano", "banana"), excluye=("macho", "deshidratado")),
     Alimento("manzana", "Manzana", "fruta", 48, 0.3, 12, 0.2, (27,), ("manzana",)),
+    Alimento("pera", "Pera", "fruta", 50, 0.4, 12, 0.1, (27,), ("pera",)),
     Alimento("naranja", "Naranja / mandarina", "fruta", 35, 0.7, 8, 0.1, (27,),
              (), alguna=("naranja", "mandarina"), excluye=("zumo",)),
+    Alimento("kiwi", "Kiwi", "fruta", 50, 0.9, 11, 0.5, (27,), ("kiwi",)),
+    Alimento("aguacate", "Aguacate", "fruta", 115, 1.4, 2, 10.5, (27,), ("aguacate",)),
     # --- verdura ---
     Alimento("tomate", "Tomate", "verdura", 18, 0.9, 3.5, 0.2, (29,),
              ("tomate",), excluye=("cherry", "rallado", "rama", "rosa", "negro", "frito", "kumato")),
-    Alimento("calabacin", "Calabacín", "verdura", 17, 1.2, 3, 0.3, (29,), ("calabacin",)),
-    Alimento("pimiento", "Pimiento", "verdura", 25, 1, 5, 0.3, (29,),
-             ("pimiento",), excluye=("semipicante", "salteado", "padron", "tricolor", "asado")),
+    Alimento("pimiento_rojo", "Pimiento rojo", "verdura", 31, 1, 6, 0.3, (29,),
+             ("pimiento rojo",)),
+    Alimento("pimiento_verde", "Pimiento verde", "verdura", 25, 1, 5, 0.3, (29,),
+             ("pimiento verde",)),
     Alimento("cebolla", "Cebolla", "verdura", 40, 1.1, 9, 0.1, (29,),
              ("cebolla",), excluye=("tierna", "morada", "frita", "salteado", "crujiente")),
+    Alimento("calabacin", "Calabacín", "verdura", 17, 1.2, 3, 0.3, (29,), ("calabacin",)),
     Alimento("zanahoria", "Zanahoria", "verdura", 40, 0.9, 9, 0.2, (29,),
              ("zanahoria",), excluye=("palitos", "rallada")),
-    Alimento("espinacas", "Espinacas", "verdura", 23, 2.9, 3.6, 0.4, (29, 28), ("espinaca",)),
+    Alimento("canonigos", "Canónigos", "verdura", 21, 2, 3.6, 0.4, (28,), ("canonigos",)),
     # --- hidratos ---
     Alimento("pan", "Pan de molde integral", "pan", 250, 10, 42, 4, (60,),
              ("pan de molde", "integral"),
              excluye=("sin corteza", "espelta", "avena", "burger", "tortilla", "hogaza")),
     Alimento("patata", "Patata", "verdura", 77, 2, 17, 0.1, (29,),
              ("patata",), excluye=("freir", "guarnicion", "boniato", "dulce")),
+    Alimento("batata", "Batata", "verdura", 86, 1.6, 20, 0.1, (29,),
+             ("batata",), excluye=("microondas",)),
     Alimento("arroz", "Arroz", "despensa", 350, 7, 78, 0.6, (118,),
              ("arroz",), alguna=("redondo", "largo"), excluye=("cocido", "integral"), duradero=True),
     Alimento("pasta", "Pasta", "despensa", 355, 12, 72, 1.5, (120,),
@@ -97,47 +114,32 @@ CATALOGO = {a.clave: a for a in [
              ("avena",), alguna=("copos", "molida"),
              excluye=("chocolate", "cacao", "crunchy", "sin gluten", "barrita", "semillas", "cereales"),
              duradero=True),
-    # --- grasas ---
+    Alimento("masa_empanada", "Masa fresca de empanada", "pan", 320, 6.5, 42, 14, (69,),
+             ("masa fresca empanada",)),
+    Alimento("fabada", "Fabada de bote", "despensa", 130, 6.5, 9, 7.5, (140,),
+             ("fabada",), duradero=True),
+    # --- grasas y otros ---
     Alimento("aove", "Aceite de oliva virgen extra", "despensa", 900, 0, 0, 100, (112,),
              ("aceite de oliva virgen extra",), excluye=("spray", "seleccion", "picual"),
              duradero=True),
     Alimento("nueces", "Nueces", "despensa", 650, 15, 7, 65, (133,),
              ("nuez",), alguna=("pelada", "troceada"), excluye=("brasil", "pecana"), duradero=True),
-    Alimento("cacahuete", "Cacahuete tostado sin sal", "despensa", 590, 26, 12, 49, (133,),
-             ("cacahuete", "tostado", "0% sal"), duradero=True),
+    Alimento("crema_cacahuete", "Crema de cacahuete 100%", "despensa", 590, 25, 12, 49, (92,),
+             ("crema de cacahuete",), duradero=True),
+    Alimento("miel", "Miel", "despensa", 304, 0.3, 82, 0, (90,), ("miel de flores",),
+             duradero=True),
+    Alimento("soja", "Salsa de soja", "despensa", 60, 8, 6, 0, (117,),
+             ("salsa de soja",), excluye=("sin gluten",), duradero=True),
 ]}
 
 # Proteína whey de HSN (Evowhey Protein). No se compra en Mercadona, pero cuenta para los
 # macros. Valores medios por 100 g: revisa la etiqueta de tu sabor.
 WHEY = Alimento("whey", "Whey Evowhey (HSN)", "suplementos", 380, 75, 7, 6, (), ())
 
-# Cantidades fijas diarias (g o ml), independientes de las kcal
-BASE_DIARIA = {
-    "huevos": 120, "leche": 300, "queso_batido": 200,
-    "platano": 250, "manzana": 190, "naranja": 250,
-    "tomate": 120, "calabacin": 100, "pimiento": 60, "cebolla": 50,
-    "zanahoria": 50, "espinacas": 40,
-    "aove": 25, "nueces": 20, "cacahuete": 15,
-}
-
-# Reparto de la proteína que falta (tras la base) entre las fuentes principales.
-# Se prueban en orden: si una variante se pasa del presupuesto, se usa la siguiente.
-VARIANTES_PROTEINA = [
-    ("equilibrada", {"pollo_pechuga": 40, "pavo": 15, "atun": 15, "merluza": 10,
-                     "garbanzos": 10, "lentejas": 10}, {}),
-    ("ahorro", {"pollo_pechuga": 35, "pollo_contramuslo": 25, "atun": 15,
-                "garbanzos": 12.5, "lentejas": 12.5}, {}),
-    ("ahorro máximo", {"pollo_contramuslo": 45, "pollo_pechuga": 15,
-                       "garbanzos": 20, "lentejas": 20}, {"huevos": 180}),
-]
-
-# Reparto de los hidratos que faltan
-REPARTO_HIDRATOS = {"arroz": 35, "avena": 20, "pasta": 20, "pan": 15, "patata": 10}
-
 # Se miden en ml
-LIQUIDOS = {"leche", "aove"}
+LIQUIDOS = {"leche", "aove", "soja"}
 
-# Mínimo de grasa añadida (AOVE) aunque se cubra la grasa con otros alimentos
+# Mínimo de aceite para cocinar comida y cena, aunque la grasa ya esté cubierta
 AOVE_MINIMO = 10
 
 

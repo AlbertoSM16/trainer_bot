@@ -3,10 +3,9 @@ import math
 from dataclasses import dataclass, field
 from datetime import date
 
-from alimentos import (LIQUIDOS, SECCIONES, VARIANTES_PROTEINA, WHEY, Alimento, disponibles,
-                       suplementos_diarios)
+from alimentos import LIQUIDOS, SECCIONES, WHEY, Alimento, disponibles, suplementos_diarios
 from config import CREATINA_GRAMOS, PRESUPUESTO_SEMANAL
-from menu import _md, menu_dia
+from menu import VARIANTES, _md, menu_dia
 from mercadona import Producto
 from nutricion import Objetivo
 
@@ -59,7 +58,7 @@ def construir(objetivos: list[Objetivo], opciones: dict[str, list[Producto]]) ->
     cat = disponibles()
     con_precios = any(opciones.values())
     lista = None
-    for nombre, _, _ in VARIANTES_PROTEINA:
+    for nombre, _ in VARIANTES:
         semana: dict[str, float] = {}
         for o in objetivos:
             for k, g in menu_dia(o, nombre).gramos.items():
@@ -72,7 +71,7 @@ def construir(objetivos: list[Objetivo], opciones: dict[str, list[Producto]]) ->
 
 
 def _peso(gramos: float, liquido: bool) -> str:
-    if gramos < 1000:
+    if round(gramos / 10) * 10 < 1000:
         return f"{round(gramos / 10) * 10:.0f} {'ml' if liquido else 'g'}"
     return f"{gramos / 1000:.1f} {'l' if liquido else 'kg'}".replace(".", ",")
 

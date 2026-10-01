@@ -8,7 +8,13 @@ Estructura semanal fija (adaptada a jornada laboral 8-18 L-J, viernes hasta 14h)
   Viernes    -> NATACIÓN + rodaje suave
   Sábado     -> TIRADA LARGA
   Domingo    -> BICI Z2 / descanso activo
+
+Cada usuario puede cambiar su semana (/mover, /saltar, /cambiar). Los cambios se
+guardan fuera (SQLite) y llegan aquí como `Cambio`: el día hace la sesión base de
+`origen` (dentro de la misma semana) en el `modo` indicado.
 """
+import re
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 import gym
@@ -22,6 +28,20 @@ FASES = {
     3: "Fase 3 · Construcción específica",
     4: "Fase 4 · Afinado y competición",
 }
+
+
+MODOS = {
+    "descanso": "⏭️",
+    "corta": "✂️",
+    "bici": "🔁",
+    "natacion": "🔁",
+}
+
+
+@dataclass(frozen=True)
+class Cambio:
+    origen: date              # día del plan cuya sesión se hace
+    modo: str | None = None   # None o una clave de MODOS
 
 
 def _s(fase, descarga, calidad, larga, suave, bici, nata, nota=""):
@@ -144,8 +164,40 @@ def fecha_lunes(week_num: int) -> date:
     return PLAN_START + timedelta(weeks=week_num - 1)
 
 
-def sesiones_dia(dia: date) -> dict:
-    """Devuelve la sesión completa de un día concreto."""
+def sesiones_dia(dia: date, cambio: Cambio | None = None) -> dict:
+    """Sesión completa de un día, aplicando el cambio del usuario si lo hay."""
+    if cambio is None or (cambio.origen == dia and cambio.modo is None):
+        return _sesion_base(dia)
+    s = dict(_sesion_base(cambio.origen))
+    s["fecha"], s["origen"], s["modo"] = dia, cambio.origen, cambio.modo
+    if s["fuera_de_plan"]:
+        return s
+    if cambio.origen != dia:
+        s["titulo"] += f" (movida del {DIAS[cambio.origen.weekday()].lower()})"
+    if cambio.modo == "descanso":
+        s["titulo"] = f"Descanso (saltas: {s['titulo']})"
+        s["bloques"] = [("😴 Descanso", "Hoy no entrenas. Si te apetece, paseo o 10' de movilidad.")]
+    elif cambio.modo == "corta":
+        s["titulo"] += " · versión corta"
+        s["bloques"] = [("✂️ Versión corta",
+                         "Haz la mitad del volumen: mitad de minutos, km o repeticiones de "
+                         "carrera, y 1-2 series menos por ejercicio de gimnasio. "
+                         "Mantén los ritmos e intensidades.")] + s["bloques"]
+    elif cambio.modo in ("bici", "natacion"):
+        m = s["minutos"] = minutos_alternativa(cambio.origen)
+        original = s["titulo"]
+        if cambio.modo == "bici":
+            s["titulo"] = f"Bici Z2 (en lugar de: {original})"
+            s["bloques"] = [("🚴 Bici", f"{m}' en Z2 (RPE 5-6, 85-95 rpm). Sin impacto.")]
+        else:
+            s["titulo"] = f"Natación (en lugar de: {original})"
+            s["bloques"] = [("🏊 Natación", f"{m}': 300 calentamiento + series de 100-200 a "
+                                           "RPE 6 con 20\" de descanso + 200 suave.")]
+    return s
+
+
+def _sesion_base(dia: date) -> dict:
+    """Sesión del plan para un día, sin cambios del usuario."""
     wn = semana_indice(dia)
     w = datos_semana(wn)
     dow = dia.weekday()
@@ -237,7 +289,7 @@ def _semana_carrera(dow: int, w: dict) -> list:
     return tabla[dow]
 
 
-def resumen_semana(week_num: int) -> str:
+def resumen_semana(week_num: int, cambios: dict[date, Cambio] | None = None) -> str:
     w = datos_semana(week_num)
     if w is None:
         return "Esa semana está fuera del plan."
@@ -251,15 +303,22 @@ def resumen_semana(week_num: int) -> str:
     lineas = []
     for i in range(7):
         d = lunes + timedelta(days=i)
-        s = sesiones_dia(d)
-        lineas.append(f"*{DIAS[i]}* — {s['titulo']}")
+        c = (cambios or {}).get(d)
+        s = sesiones_dia(d, c)
+        marca = ""
+        if c:
+            marca = MODOS.get(c.modo, "🔀") + " "
+        lineas.append(f"*{DIAS[i]}* — {marca}{s['titulo']}")
     if w["nota"]:
         lineas += ["", f"📌 _{w['nota']}_"]
+    if cambios and any(fecha_lunes(week_num) <= d <= fecha_lunes(week_num) + timedelta(days=6)
+                       for d in cambios):
+        lineas += ["", "_🔀 movida · ⏭️ saltada · ✂️ corta · 🔁 cambiada · /deshacer_"]
     return "\n".join(cab + lineas)
 
 
-def formatear_dia(dia: date) -> str:
-    s = sesiones_dia(dia)
+def formatear_dia(dia: date, cambio: Cambio | None = None) -> str:
+    s = sesiones_dia(dia, cambio)
     if s["fuera_de_plan"] == "pre":
         faltan = (PLAN_START - dia).days
         return (f"El plan arranca el lunes {PLAN_START.strftime('%d/%m/%Y')} "
@@ -291,8 +350,13 @@ def fase_nombre_corto(fase: int | None) -> str | None:
     return FASES[fase].split(" · ", 1)[1]
 
 
-def tipos_dia(dia: date) -> list[str]:
+def tipos_dia(dia: date, cambio: Cambio | None = None) -> list[str]:
     """Categorías de entrenamiento de un día, para etiquetar en Notion."""
+    if cambio:
+        especiales = {"descanso": ["Descanso"], "bici": ["Bici"], "natacion": ["Natación"]}
+        if cambio.modo in especiales and datos_semana(semana_indice(dia)):
+            return especiales[cambio.modo]
+        dia = cambio.origen
     wn = semana_indice(dia)
     if datos_semana(wn) is None:
         return []
@@ -330,3 +394,121 @@ def tabla_ritmos() -> str:
     out += ["", "🏊 *Natación*: Z2 = RPE 5-6 (respiras cómodo), Z3 = RPE 7 (puedes decir 3-4 palabras).",
             "🚴 *Bici*: Z1 = RPE 3-4, Z2 = RPE 5-6 (85-95 rpm), Z3 = RPE 7 (80-90 rpm)."]
     return "\n".join(out)
+
+
+# ---------- cambios del usuario ----------
+
+def minutos_texto(texto: str) -> int:
+    m = re.search(r"(\d+)'", texto)
+    return int(m.group(1)) if m else 0
+
+
+def km_texto(texto: str) -> float:
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*km", texto)
+    return float(m.group(1).replace(",", ".")) if m else 0.0
+
+
+def minutos_alternativa(origen: date) -> int:
+    """Duración de la bici o natación que sustituye a la sesión de `origen`."""
+    w = datos_semana(semana_indice(origen))
+    if w is None or semana_indice(origen) == len(WEEKS):
+        return 30
+    dow = origen.weekday()
+    if dow in (0, 1, 2):
+        m = 60
+    elif dow == 3:
+        m = (minutos_texto(w["calidad"]) or 50) + 30
+    elif dow == 4:
+        m = minutos_texto(w["nata"]) + minutos_texto(w["suave"])
+    elif dow == 5:
+        m = km_texto(w["larga"]) * 5.75 * 1.3
+    else:
+        m = minutos_texto(w["bici"]) or 60
+    return int(max(30, min(120, round(m / 5) * 5)))
+
+
+def es_dia_carrera(dia: date) -> bool:
+    return semana_indice(dia) == len(WEEKS) and dia.weekday() == 6
+
+
+def efectivo(cambios: dict[date, Cambio], dia: date) -> Cambio:
+    return cambios.get(dia) or Cambio(dia)
+
+
+def _normalizar(dia: date, c: Cambio) -> Cambio | None:
+    return None if c.origen == dia and c.modo is None else c
+
+
+def mover(cambios: dict[date, Cambio], a: date, b: date) -> dict[date, Cambio | None]:
+    """Cambios a guardar para mover la sesión de `a` a `b`.
+    Si `a` está saltada, recupera su sesión en `b` (sustituye a la de `b`).
+    Si no, intercambia las sesiones de los dos días."""
+    ea, eb = efectivo(cambios, a), efectivo(cambios, b)
+    if ea.modo == "descanso":
+        return {b: _normalizar(b, Cambio(ea.origen))}
+    return {a: _normalizar(a, eb), b: _normalizar(b, ea)}
+
+
+def cambiar(cambios: dict[date, Cambio], dia: date, modo: str | None) -> dict[date, Cambio | None]:
+    return {dia: _normalizar(dia, Cambio(efectivo(cambios, dia).origen, modo))}
+
+
+def deshacer(cambios: dict[date, Cambio], dia: date) -> dict[date, Cambio | None]:
+    """Quita el cambio de `dia` y los días que hacen su sesión (el otro lado de un intercambio)."""
+    borrar = {dia} | {d for d, c in cambios.items() if c.origen == dia}
+    c = cambios.get(dia)
+    if c and c.origen in cambios and cambios[c.origen].origen == dia:
+        borrar.add(c.origen)
+    return {d: None for d in borrar if d in cambios}
+
+
+def aplicar(cambios: dict[date, Cambio], nuevos: dict[date, Cambio | None]) -> dict[date, Cambio]:
+    out = {**cambios, **nuevos}
+    return {d: c for d, c in out.items() if c is not None}
+
+
+def carga_dia(dia: date, cambios: dict[date, Cambio]) -> str:
+    """pierna | calidad | larga | otra | ligera, según la sesión que se hace ese día."""
+    c = efectivo(cambios, dia)
+    if c.modo in ("descanso", "bici", "natacion"):
+        return "ligera"
+    return {0: "pierna", 3: "calidad", 5: "larga", 6: "ligera"}.get(c.origen.weekday(), "otra")
+
+
+def avisos_semana(lunes: date, cambios: dict[date, Cambio]) -> list[str]:
+    """Combinaciones poco recomendables tras los cambios de la semana."""
+    if datos_semana(semana_indice(lunes)) is None or semana_indice(lunes) == len(WEEKS):
+        return []
+    dias = [lunes + timedelta(days=i) for i in range(7)]
+    carga = [carga_dia(d, cambios) for d in dias]
+    duros = ("pierna", "calidad", "larga")
+    out = []
+    for i in range(6):
+        par = {carga[i], carga[i + 1]}
+        nombres = f"{DIAS[i].lower()} y {DIAS[i + 1].lower()}"
+        if carga[i] == "pierna" and carga[i + 1] == "larga":
+            out.append(f"Pierna justo antes de la tirada larga ({nombres}): llegarás cargado.")
+        elif par == {"calidad", "larga"}:
+            out.append(f"Series y tirada larga en días seguidos ({nombres}): mucha carga de carrera.")
+    for i in range(5):
+        if all(c in duros for c in carga[i:i + 3]):
+            out.append(f"Tres días duros seguidos desde el {DIAS[i].lower()}.")
+    return out
+
+
+def sugerir_recuperacion(cambios: dict[date, Cambio], saltado: date, desde: date) -> date | None:
+    """Día de la semana (a partir de `desde`) más ligero para recuperar una sesión clave
+    saltada sin generar avisos. None si no hay hueco razonable."""
+    lunes = saltado - timedelta(days=saltado.weekday())
+    orden = {"ligera": 0, "otra": 1}
+    candidatos = []
+    for i in range(7):
+        d = lunes + timedelta(days=i)
+        if d < desde or d == saltado or es_dia_carrera(d):
+            continue
+        carga = carga_dia(d, cambios)
+        if carga not in orden:
+            continue
+        if not avisos_semana(lunes, aplicar(cambios, mover(cambios, saltado, d))):
+            candidatos.append((orden[carga], abs((d - saltado).days), d))
+    return min(candidatos)[2] if candidatos else None

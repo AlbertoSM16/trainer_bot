@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS mercadona_categorias (
     id          INTEGER PRIMARY KEY,
     actualizado TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cambios (
+    chat_id  INTEGER NOT NULL,
+    fecha    TEXT NOT NULL,
+    origen   TEXT NOT NULL,  -- día del plan cuya sesión se hace en `fecha`
+    modo     TEXT,           -- NULL | descanso | corta | bici | natacion
+    PRIMARY KEY (chat_id, fecha)
+);
 CREATE TABLE IF NOT EXISTS nutricion_ajuste (
     chat_id     INTEGER PRIMARY KEY,
     kcal        INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +135,32 @@ def total_entrenos(chat_id: int) -> int:
     with conn() as c:
         return c.execute("SELECT COUNT(*) n FROM entrenos WHERE chat_id = ?",
                          (chat_id,)).fetchone()["n"]
+
+
+# ---------- cambios en el plan ----------
+
+def cambios_entre(chat_id: int, desde: date, hasta: date) -> dict[date, tuple[date, str | None]]:
+    """{fecha: (origen, modo)} de los días cambiados en el rango."""
+    with conn() as c:
+        return {date.fromisoformat(r["fecha"]): (date.fromisoformat(r["origen"]), r["modo"])
+                for r in c.execute(
+                    "SELECT fecha, origen, modo FROM cambios WHERE chat_id = ? "
+                    "AND fecha BETWEEN ? AND ?", (chat_id, desde.isoformat(), hasta.isoformat()))}
+
+
+def guardar_cambios(chat_id: int, cambios: dict[date, tuple[date, str | None] | None]):
+    """Aplica los cambios de varios días a la vez. `None` borra el cambio de ese día."""
+    with conn() as c:
+        for fecha, cambio in cambios.items():
+            if cambio is None:
+                c.execute("DELETE FROM cambios WHERE chat_id = ? AND fecha = ?",
+                          (chat_id, fecha.isoformat()))
+            else:
+                c.execute(
+                    "INSERT INTO cambios (chat_id, fecha, origen, modo) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(chat_id, fecha) DO UPDATE SET origen = excluded.origen, "
+                    "modo = excluded.modo",
+                    (chat_id, fecha.isoformat(), cambio[0].isoformat(), cambio[1]))
 
 
 # ---------- dieta ----------

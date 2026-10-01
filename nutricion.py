@@ -2,7 +2,6 @@
 
 Todo es puro (sin I/O): recibe el peso y el ajuste acumulado y devuelve números.
 """
-import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 
@@ -37,6 +36,7 @@ class Objetivo:
     proteina: int
     grasa: int
     hidratos: int
+    consejo: str = ""
 
 
 def tmb(peso: float) -> float:
@@ -44,18 +44,21 @@ def tmb(peso: float) -> float:
     return 10 * peso + 6.25 * ATHLETE["altura_cm"] - 5 * ATHLETE["edad"] + 5
 
 
-def _minutos(texto: str) -> int:
-    m = re.search(r"(\d+)'", texto)
-    return int(m.group(1)) if m else 0
+_minutos = plan.minutos_texto
+_km = plan.km_texto
 
 
-def _km(texto: str) -> float:
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*km", texto)
-    return float(m.group(1).replace(",", ".")) if m else 0.0
-
-
-def gasto_ejercicio(dia: date, peso: float) -> int:
-    """Estimación de las kcal gastadas en la sesión planificada de ese día."""
+def gasto_ejercicio(dia: date, peso: float, cambio: plan.Cambio | None = None) -> int:
+    """Estimación de las kcal gastadas en la sesión que se hace ese día (con los cambios)."""
+    if cambio and plan.datos_semana(plan.semana_indice(dia)):
+        if cambio.modo == "descanso":
+            return 0
+        if cambio.modo == "bici":
+            return plan.minutos_alternativa(cambio.origen) * KCAL_MIN_BICI
+        if cambio.modo == "natacion":
+            return plan.minutos_alternativa(cambio.origen) * KCAL_MIN_NATACION
+        base = gasto_ejercicio(cambio.origen, peso)
+        return round(base * 0.5) if cambio.modo == "corta" else base
     s = plan.sesiones_dia(dia)
     if s["fuera_de_plan"]:
         return KCAL_FUERA_DE_PLAN
@@ -85,19 +88,22 @@ def gasto_ejercicio(dia: date, peso: float) -> int:
     return round(_minutos(w["bici"]) * KCAL_MIN_BICI)
 
 
-def objetivo_dia(dia: date, peso: float, ajuste: int = 0) -> Objetivo:
+def objetivo_dia(dia: date, peso: float, ajuste: int = 0,
+                 cambio: plan.Cambio | None = None) -> Objetivo:
     base = round(tmb(peso) * FACTOR_NEAT)
-    ejercicio = gasto_ejercicio(dia, peso)
+    ejercicio = gasto_ejercicio(dia, peso, cambio)
     kcal = round((base + ejercicio + SUPERAVIT_KCAL + ajuste) / 50) * 50
     proteina = round(PROTEINA_G_KG * peso)
     grasa = round(GRASA_G_KG * peso)
     hidratos = max(0, round((kcal - proteina * 4 - grasa * 9) / 4))
-    return Objetivo(dia, plan.sesiones_dia(dia)["titulo"], base, ejercicio, SUPERAVIT_KCAL,
-                    ajuste, kcal, proteina, grasa, hidratos)
+    return Objetivo(dia, plan.sesiones_dia(dia, cambio)["titulo"], base, ejercicio, SUPERAVIT_KCAL,
+                    ajuste, kcal, proteina, grasa, hidratos, consejo(dia, cambio))
 
 
-def objetivos_semana(desde: date, peso: float, ajuste: int = 0) -> list[Objetivo]:
-    return [objetivo_dia(desde + timedelta(days=i), peso, ajuste) for i in range(7)]
+def objetivos_semana(desde: date, peso: float, ajuste: int = 0,
+                     cambios: dict[date, plan.Cambio] | None = None) -> list[Objetivo]:
+    dias = [desde + timedelta(days=i) for i in range(7)]
+    return [objetivo_dia(d, peso, ajuste, (cambios or {}).get(d)) for d in dias]
 
 
 def nuevo_ajuste(pesos: list[tuple[date, float]], hoy: date, actual: int) -> tuple[int, str]:
@@ -118,11 +124,15 @@ def nuevo_ajuste(pesos: list[tuple[date, float]], hoy: date, actual: int) -> tup
     return nuevo, f"Cambio semanal {cambio:+.2f} kg: {motivo} ({nuevo - actual:+d} kcal)."
 
 
-def consejo(dia: date) -> str:
-    dow = dia.weekday()
+def consejo(dia: date, cambio: plan.Cambio | None = None) -> str:
     s = plan.sesiones_dia(dia)
     if s["fuera_de_plan"]:
         return "Reparte la proteína en 4-5 tomas de 30-40 g."
+    if cambio and cambio.modo in ("descanso", "bici", "natacion"):
+        return "Día más ligero: reparte la proteína en 4-5 tomas y no te saltes comidas."
+    if cambio:
+        dia = cambio.origen
+    dow = dia.weekday()
     if s["semana"] == plan.total_semanas() and dow in (4, 5):
         return "Carga de hidratos: arroz, pasta y pan en cada comida; poca fibra y grasa."
     return {
@@ -149,5 +159,5 @@ def formatear_objetivo(o: Objetivo) -> str:
         "",
         f"_Base {o.base} + entreno {o.ejercicio} + superávit {o.superavit}{ajuste}_",
         "",
-        f"💡 {consejo(o.fecha)}",
+        f"💡 {o.consejo or consejo(o.fecha)}",
     ])
