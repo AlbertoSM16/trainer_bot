@@ -1,4 +1,9 @@
-"""Rutinas de gimnasio (4 días/semana, alternancia A/B semana a semana)."""
+"""Rutinas de gimnasio (4 días/semana, alternancia A/B semana a semana).
+
+Orden semanal: pecho + tríceps (L), espalda + bíceps (M), pierna (X) y hombro + core
+(S, después de correr). Enfoque de hipertrofia: básicos a 6-8 reps y accesorios a 8-15
+con RIR 1-2.
+"""
 
 PIERNA = {
     "A": {
@@ -77,27 +82,27 @@ ESPALDA_BICEPS = {
     },
 }
 
-HOMBRO_ABS = {
+HOMBRO_CORE = {
     "A": {
-        "titulo": "HOMBRO + ABDOMEN A",
+        "titulo": "HOMBRO + CORE A",
         "ejercicios": [
             "Press militar con barra de pie — 4x6-8",
             "Elevaciones laterales con mancuernas — 4x12-15",
             "Pájaros / deltoide posterior en banco — 3x15",
             "Face pull — 3x15",
             "Encogimientos de trapecio — 3x12",
-            "ABS: rueda abdominal 3x10 + elevación de piernas colgado 3x12 + plancha lateral 3x30s/lado",
+            "CORE: rueda abdominal 3x10 + elevación de piernas colgado 3x12 + plancha lateral 3x30s/lado",
         ],
     },
     "B": {
-        "titulo": "HOMBRO + ABDOMEN B",
+        "titulo": "HOMBRO + CORE B",
         "ejercicios": [
             "Press Arnold — 4x10",
             "Elevaciones laterales en polea — 4x12 por brazo",
             "Remo al mentón agarre ancho — 3x12",
             "Pájaros en máquina — 3x15",
             "Face pull — 3x15",
-            "ABS: crunch en polea 3x15 + hollow hold 3x30s + russian twist 3x20",
+            "CORE: crunch en polea 3x15 + hollow hold 3x30s + pallof press 3x12 por lado",
         ],
     },
 }
@@ -108,7 +113,7 @@ def bloque(grupo: str, variante: str) -> dict:
         "pierna": PIERNA,
         "pecho": PECHO_TRICEPS,
         "espalda": ESPALDA_BICEPS,
-        "hombro": HOMBRO_ABS,
+        "hombro": HOMBRO_CORE,
     }[grupo][variante]
 
 
@@ -117,5 +122,6 @@ def formatear(grupo: str, variante: str) -> str:
     lineas = [f"🏋️ *{b['titulo']}*", ""]
     lineas += [f"• {e}" for e in b["ejercicios"]]
     lineas.append("")
-    lineas.append("_Calienta 8' + series de aproximación. Progresa peso o reps cada semana._")
+    lineas.append("_Calienta 8' + series de aproximación. Accesorios a RIR 1-2 (te quedan 1-2 reps). "
+                  "Progresa peso o reps cada semana._")
     return "\n".join(lineas)

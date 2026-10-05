@@ -4,7 +4,9 @@ Es puro (sin I/O) y es la única fuente de cantidades: la lista de la compra sum
 menús de los 7 días, así que lo que se compra coincide con lo que se come.
 
 Cada día tiene un plato fijo por comida (según el día de la semana y, la comida del
-sábado, la semana del plan). Los gramos de la proteína y los hidratos principales se
+sábado, la semana del plan: legumbre de bote rotando lentejas, cocido y fabada). El
+usuario puede cambiar el plato de cualquier comida (`platos_usuario`). Fruta fija: plátano
+en desayuno o merienda, manzana de postre en el táper y kiwi en la cena. Los gramos de la proteína y los hidratos principales se
 escalan para cuadrar los macros del día. El resto de ingredientes van en cantidad fija,
 y el aceite (y, si sobra grasa, los frutos secos) ajusta la grasa.
 """
@@ -26,12 +28,13 @@ COMIDAS = {
 PESO_HIDRATOS = {"desayuno": 18, "merienda": 12, "comida": 35, "cena": 35}
 # Proteína mínima (g) de la fuente principal de cada plato que la tenga
 PROTEINA_MIN_PLATO = 30
-FRUTAS = ("manzana", "pera", "naranja", "kiwi")
+# Postre de cada comida principal (si se come fuera, pasa a la merienda)
+POSTRES = {"comida": ("manzana", 180), "cena": ("kiwi", 150)}
 # Máximo razonable por plato (g en crudo). Lo que no cabe pasa a los otros hidratos del día
 TOPE_HIDRATOS = {"pan": 100, "avena": 110, "masa_empanada": 230, "patata": 450, "batata": 400,
-                 "arroz": 200, "pasta": 200}
+                 "arroz": 200, "pasta": 200, "noodles": 200, "tortillas": 270}
 # Si todo llega al tope, lo que falta va al primer grupo de estos que haya en el día
-DESBORDE_HIDRATOS = (("arroz", "pasta", "patata", "batata"), ("avena", "pan"))
+DESBORDE_HIDRATOS = (("arroz", "pasta", "noodles", "patata", "batata"), ("avena", "pan"))
 
 
 @dataclass(frozen=True)
@@ -62,8 +65,8 @@ PLATOS = {
         "Batido de whey + tostada con crema de cacahuete y plátano",
         hidratos={"pan": 1}, fijos={"platano": 120}, secos={"crema_cacahuete": 20}),
     "yogur_whey": Plato(
-        "Yogur 0% con whey, avena, nueces y fruta", hidratos={"avena": 1},
-        fijos={"yogur": 200, "fruta": 180}, secos={"nueces": 20}),
+        "Yogur 0% con whey, avena, miel y nueces", hidratos={"avena": 1},
+        fijos={"yogur": 200, "miel": 10}, secos={"nueces": 15}),
     # --- comidas y cenas ---
     "ternera_arroz": Plato(
         "{p} con pimientos y cebolla + arroz", "ternera_picada", {"arroz": 1},
@@ -100,6 +103,21 @@ PLATOS = {
         "{p} en airfryer + batata y pimientos asados", "pavo_solomillo",
         {"batata": 0.7, "pan": 0.3}, {"pimiento_rojo": 80, "pimiento_verde": 60}, aceite=True,
         nota="Airfryer 190 °C: batata en dados 20', carne y pimientos 12-15'."),
+    "pollo_noodles": Plato(
+        "Noodles salteados con {p}, zanahoria y pimiento", "pollo_pechuga", {"noodles": 1},
+        {"zanahoria": 60, "pimiento_rojo": 60, "cebolla": 40, "soja": 15}, aceite=True,
+        nota="Cuece los noodles 3-4', saltea la carne en tiras con la verdura y mezcla. "
+             "La soja al final."),
+    "cerdo_arroz": Plato(
+        "{p} con pimientos y cebolla + arroz", "cerdo_solomillo", {"arroz": 1},
+        {"pimiento_rojo": 80, "pimiento_verde": 50, "cebolla": 50}, aceite=True,
+        nota="Solomillo en medallones a la plancha (3-4' por lado) o airfryer 190 °C 12'. "
+             "Arroz hervido aparte."),
+    "fajitas": Plato(
+        "Fajitas de {p} con pimientos y cebolla", "pollo_pechuga", {"tortillas": 1},
+        {"pimiento_rojo": 80, "pimiento_verde": 60, "cebolla": 60, "tomate": 60}, aceite=True,
+        nota="Saltea la carne en tiras con la verdura y especias de fajita. "
+             "También valen pavo o ternera picada."),
     "pasta_empresa": Plato(
         "Pasta en el trabajo", "pollo_pechuga", {"pasta": 1}, aceite=True, fuera=True,
         nota="Te la paga la empresa. Ración generosa y, si hay, que lleve carne, atún o huevo."),
@@ -119,6 +137,12 @@ PLATOS = {
     "fabada": Plato(
         "Fabada de bote + pan", hidratos={"pan": 1}, fijos={"fabada": 420},
         nota="Un bote. Es el plato con más grasa: el resto del día lleva menos aceite."),
+    "lentejas": Plato(
+        "Lentejas de bote + pan", hidratos={"pan": 1}, fijos={"lentejas": 420},
+        nota="Un bote. Si quieres más proteína, añade un huevo cocido."),
+    "cocido": Plato(
+        "Cocido de bote + pan", hidratos={"pan": 1}, fijos={"cocido": 420},
+        nota="Un bote. Caliéntalo en un cazo y añade un poco de agua si queda espeso."),
     "salchichas": Plato(
         "Salchichas de pollo en airfryer + batata + canónigos con tomate + pan",
         hidratos={"batata": 0.7, "pan": 0.3}, fijos={"salchichas_pollo": 160, "canonigos": 40, "tomate": 100},
@@ -128,16 +152,17 @@ PLATOS = {
 DESAYUNOS = ("tostadas", "bol_queso", "tostadas", "bol_yogur", "tostadas", "bol_queso", "tostadas")
 MERIENDAS = ("whey_tostada", "yogur_whey") * 3 + ("whey_tostada",)
 # (comida, cena) por día de la semana. La comida del sábado alterna por semana del plan.
+# Carne en el táper (L-X) y pescado por la noche o el fin de semana.
 SEMANA = (
     ("ternera_arroz", "salmon_patata"),
-    ("arroz_frito", "merluza_verduras"),
-    ("pollo_pimientos", "pavo_batata"),
+    ("pollo_noodles", "merluza_verduras"),
+    ("cerdo_arroz", "fajitas"),
     ("pasta_empresa", "pota"),
-    ("macarrones_ternera", "cena_fuera"),
+    ("pavo_batata", "cena_fuera"),
     (None, "empanada"),
     ("empanada", "pollo_ensalada"),
 )
-COMIDA_SABADO = ("fabada", "salchichas")  # semanas impares / pares
+COMIDA_SABADO = ("lentejas", "cocido", "fabada")  # legumbre de bote, rota cada semana
 
 # Variantes de presupuesto: sustituciones de la proteína principal, de más cara a más barata
 VARIANTES = [
@@ -147,6 +172,7 @@ VARIANTES = [
 ]
 NOMBRE_CORTO = {
     "pollo_pechuga": "Pollo", "ternera_picada": "Ternera picada", "pavo_solomillo": "Solomillo de pavo",
+    "cerdo_solomillo": "Solomillo de cerdo",
     "merluza": "Merluza", "salmon": "Salmón", "pota": "Pota", "atun": "Atún",
 }
 
@@ -180,19 +206,30 @@ def _macros(gramos: dict[str, float], cat: dict[str, Alimento]) -> dict[str, flo
     return t
 
 
-def _fruta(dia: date, n: int) -> str:
-    return FRUTAS[(dia.toordinal() + n) % len(FRUTAS)]
+def platos_validos(comida: str) -> list[str]:
+    """Platos que se pueden poner en una comida (para los cambios del usuario)."""
+    if comida == "desayuno":
+        return sorted(set(DESAYUNOS))
+    if comida == "merienda":
+        return sorted(set(MERIENDAS))
+    return [k for k in PLATOS if k not in set(DESAYUNOS) | set(MERIENDAS)]
 
 
-def platos_dia(dia: date, variante: str = "equilibrada") -> dict[str, Plato]:
+def platos_dia(dia: date, variante: str = "equilibrada",
+               platos_usuario: dict[str, str] | None = None) -> dict[str, Plato]:
+    """Plato de cada comida. `platos_usuario` ({comida: clave}) sustituye a los del plan."""
     dow = dia.weekday()
     comida, cena = SEMANA[dow]
     if comida is None:
-        comida = COMIDA_SABADO[(semana_indice(dia) + 1) % 2]
+        comida = COMIDA_SABADO[max(semana_indice(dia) - 1, 0) % len(COMIDA_SABADO)]
     cambios = dict(VARIANTES)[variante]
+    elegidos = {"desayuno": DESAYUNOS[dow], "comida": comida,
+                "merienda": MERIENDAS[dow], "cena": cena}
+    for c, clave in (platos_usuario or {}).items():
+        if c in elegidos and clave in PLATOS:
+            elegidos[c] = clave
     out = {}
-    for nombre_comida, clave in (("desayuno", DESAYUNOS[dow]), ("comida", comida),
-                                 ("merienda", MERIENDAS[dow]), ("cena", cena)):
+    for nombre_comida, clave in elegidos.items():
         p = PLATOS[clave]
         if p.proteina in cambios:
             p = Plato(**{**p.__dict__, "proteina": cambios[p.proteina]})
@@ -209,12 +246,17 @@ def _componentes(dia: date, platos: dict[str, Plato]) -> list[Componente]:
     out: list[Componente] = []
     for comida, p in platos.items():
         fijos = dict(p.fijos)
-        if "fruta" in fijos:
-            fijos[_fruta(dia, 1)] = fijos.pop("fruta")
-        if comida == "comida" and not p.fuera:
-            fijos[_fruta(dia, 0)] = fijos.get(_fruta(dia, 0), 0) + 180  # postre en el táper
         if comida == "merienda":
             fijos.update(suplementos_diarios())
+            # postres de las comidas que se hacen fuera
+            for c, (fruta, g) in POSTRES.items():
+                if platos[c].fuera:
+                    fijos[fruta] = fijos.get(fruta, 0) + g
+        if comida in POSTRES and not p.fuera:
+            fruta, g = POSTRES[comida]
+            fijos[fruta] = fijos.get(fruta, 0) + g
+        if comida == "desayuno" and not any("platano" in q.fijos for q in platos.values()):
+            fijos["platano"] = 120
         out += [(comida, k, "fijo", g) for k, g in fijos.items()]
         out += [(comida, k, "seco", g) for k, g in p.secos.items()]
         if p.proteina:
@@ -317,8 +359,9 @@ def _resolver(o: Objetivo, comps: list[Componente]) -> list[float]:
     return out
 
 
-def menu_dia(o: Objetivo, variante: str = "equilibrada") -> Menu:
-    platos = platos_dia(o.fecha, variante)
+def menu_dia(o: Objetivo, variante: str = "equilibrada",
+             platos_usuario: dict[str, str] | None = None) -> Menu:
+    platos = platos_dia(o.fecha, variante, platos_usuario)
     comps = _componentes(o.fecha, platos)
     gramos_comp = _resolver(o, comps)
     comidas: dict[str, list[tuple[str, float]]] = {c: [] for c in COMIDAS}
@@ -381,4 +424,18 @@ def formatear(m: Menu) -> str:
         out.append("_Lo que comes fuera está estimado y no va en la lista de la compra._")
     if m.variante != "equilibrada":
         out.append(f"_Proteína en modo {m.variante} para cuadrar el presupuesto._")
+    return "\n".join(out)
+
+
+def formatear_semana(menus: list[Menu]) -> str:
+    """Resumen de los platos de varios días (sin gramos, para caber en un mensaje)."""
+    iconos = {"desayuno": "🌅", "comida": "🥡", "merienda": "🥤", "cena": "🌙"}
+    out = [f"📋 *Menú de la semana* ({menus[0].objetivo.fecha.strftime('%d/%m')} – "
+           f"{menus[-1].objetivo.fecha.strftime('%d/%m')})"]
+    for m in menus:
+        d = m.objetivo.fecha
+        out += ["", f"*{DIAS[d.weekday()]} {d.strftime('%d/%m')}* · {m.objetivo.kcal} kcal"]
+        out += [f"{iconos[c]} {_md(m.nombre_plato(c))}" for c in COMIDAS]
+    out += ["", "_Cantidades de cada día con /menu (o /menu mañana). "
+                "Cambia un plato con /plato._"]
     return "\n".join(out)

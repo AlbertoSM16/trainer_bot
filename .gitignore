@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 .idea/
 notion_dbs.json
+
+*.log

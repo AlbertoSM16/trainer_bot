@@ -35,10 +35,9 @@ ESQUEMA_ENTRENOS = {
             ["blue", "green", "yellow", "orange", "pink", "purple", "gray"])]}},
     "Semana": {"number": {}},
     "Fase": {"select": {"options": [
-        {"name": "Reconstrucción aeróbica", "color": "gray"},
-        {"name": "Base y fuerza aeróbica", "color": "blue"},
-        {"name": "Construcción específica", "color": "orange"},
-        {"name": "Afinado y competición", "color": "red"},
+        {"name": "Reconstrucción", "color": "gray"},
+        {"name": "Base aeróbica", "color": "blue"},
+        {"name": "Desarrollo", "color": "orange"},
     ]}},
     "Tipo": {"multi_select": {"options": [
         {"name": "Gimnasio", "color": "purple"},

@@ -50,8 +50,10 @@ def _elegir(alimento: Alimento, gramos: float, opciones: list[Producto]) -> Line
     return linea
 
 
-def construir(objetivos: list[Objetivo], opciones: dict[str, list[Producto]]) -> Lista:
-    """`opciones` asocia la clave de cada alimento con los productos candidatos de Mercadona."""
+def construir(objetivos: list[Objetivo], opciones: dict[str, list[Producto]],
+              platos_usuario: dict[date, dict[str, str]] | None = None) -> Lista:
+    """`opciones` asocia la clave de cada alimento con los productos candidatos de Mercadona.
+    `platos_usuario` son los platos cambiados por el usuario ({fecha: {comida: plato}})."""
     n = len(objetivos)
     media = {m: sum(getattr(o, m) for o in objetivos) / n
              for m in ("kcal", "proteina", "grasa", "hidratos")}
@@ -61,7 +63,7 @@ def construir(objetivos: list[Objetivo], opciones: dict[str, list[Producto]]) ->
     for nombre, _ in VARIANTES:
         semana: dict[str, float] = {}
         for o in objetivos:
-            for k, g in menu_dia(o, nombre).gramos.items():
+            for k, g in menu_dia(o, nombre, (platos_usuario or {}).get(o.fecha)).gramos.items():
                 semana[k] = semana.get(k, 0) + g
         lineas = [_elegir(cat[k], g, opciones.get(k, [])) for k, g in semana.items() if k in cat]
         lista = Lista(objetivos[0].fecha, objetivos[-1].fecha, media, nombre, lineas, con_precios)
