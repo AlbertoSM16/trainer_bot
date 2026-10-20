@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS garmin_bienestar (
     sueno_puntos  INTEGER,
     body_battery  INTEGER,
     pred_media_s  INTEGER,
+    fc_umbral     INTEGER,
     aplicado      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, fecha)
 );
@@ -162,11 +163,29 @@ CREATE TABLE IF NOT EXISTS garmin_programados (
     hash        TEXT NOT NULL,
     PRIMARY KEY (chat_id, fecha, clave)
 );
+-- Gimnasio reorganizado: grupos que se hacen en esa fecha (separados por comas; vacío = sin gym)
+CREATE TABLE IF NOT EXISTS gym_reparto (
+    chat_id     INTEGER NOT NULL,
+    fecha       TEXT NOT NULL,
+    grupos      TEXT NOT NULL,
+    PRIMARY KEY (chat_id, fecha)
+);
+-- Consejo del día de /carrera y /bici (para el botón del reloj y comparar con lo hecho)
+CREATE TABLE IF NOT EXISTS consejos (
+    chat_id     INTEGER NOT NULL,
+    fecha       TEXT NOT NULL,
+    deporte     TEXT NOT NULL,        -- carrera | bici
+    clave       TEXT NOT NULL,
+    datos       TEXT NOT NULL,        -- JSON de consejo.Consejo
+    PRIMARY KEY (chat_id, fecha, deporte)
+);
 """
 # Versión del esquema (PRAGMA user_version). 2: semana nueva (L pecho … D bici), así que
 # los cambios guardados con el mapeo anterior dejan de tener sentido y se borran.
 # 3: semana tipo y rutina por usuario, series y Garmin (solo tablas nuevas).
-VERSION = 3
+# 4: reparto dinámico del gimnasio (tabla nueva).
+# 5: consejo diario de carrera/bici y FC de umbral del reloj.
+VERSION = 5
 
 
 @contextmanager
@@ -186,6 +205,9 @@ def init():
         version = c.execute("PRAGMA user_version").fetchone()[0]
         if version < 2:
             c.execute("DELETE FROM cambios")
+        columnas = {f["name"] for f in c.execute("PRAGMA table_info(garmin_bienestar)")}
+        if "fc_umbral" not in columnas:
+            c.execute("ALTER TABLE garmin_bienestar ADD COLUMN fc_umbral INTEGER")
         if version < VERSION:
             c.execute(f"PRAGMA user_version = {VERSION}")
 
@@ -601,7 +623,7 @@ def actividad(chat_id: int, actividad_id: int) -> dict | None:
 
 
 CAMPOS_BIENESTAR = ("readiness", "readiness_txt", "hrv_estado", "hrv_media", "sueno_h",
-                    "sueno_puntos", "body_battery", "pred_media_s")
+                    "sueno_puntos", "body_battery", "pred_media_s", "fc_umbral")
 
 
 def guardar_bienestar(chat_id: int, fecha: date, datos: dict):
@@ -663,3 +685,54 @@ def borrar_programado(chat_id: int, fecha: str, clave: str):
     with conn() as c:
         c.execute("DELETE FROM garmin_programados WHERE chat_id = ? AND fecha = ? AND clave = ?",
                   (chat_id, fecha, clave))
+
+
+# ---------- reparto del gimnasio ----------
+
+def reparto(chat_id: int, desde: date, hasta: date) -> dict[date, tuple[str, ...]]:
+    with conn() as c:
+        filas = c.execute("SELECT fecha, grupos FROM gym_reparto WHERE chat_id = ? AND fecha >= ? "
+                          "AND fecha <= ?", (chat_id, desde.isoformat(), hasta.isoformat()))
+        return {date.fromisoformat(f["fecha"]): tuple(g for g in f["grupos"].split(",") if g)
+                for f in filas}
+
+
+def guardar_reparto(chat_id: int, desde: date, hasta: date,
+                    nuevo: dict[date, tuple[str, ...]]):
+    """Sustituye el reparto entre `desde` y `hasta` (incluidos) por `nuevo`."""
+    with conn() as c:
+        c.execute("DELETE FROM gym_reparto WHERE chat_id = ? AND fecha >= ? AND fecha <= ?",
+                  (chat_id, desde.isoformat(), hasta.isoformat()))
+        for f, grupos in nuevo.items():
+            c.execute("INSERT INTO gym_reparto (chat_id, fecha, grupos) VALUES (?, ?, ?)",
+                      (chat_id, f.isoformat(), ",".join(grupos)))
+
+
+# ---------- consejo diario ----------
+
+def guardar_consejo(chat_id: int, fecha: date, datos: dict):
+    with conn() as c:
+        c.execute("INSERT OR REPLACE INTO consejos (chat_id, fecha, deporte, clave, datos) "
+                  "VALUES (?, ?, ?, ?, ?)", (chat_id, fecha.isoformat(), datos["deporte"],
+                                             datos["clave"], json.dumps(datos, ensure_ascii=False)))
+
+
+def consejo(chat_id: int, fecha: date, deporte: str) -> dict | None:
+    with conn() as c:
+        f = c.execute("SELECT datos FROM consejos WHERE chat_id = ? AND fecha = ? AND deporte = ?",
+                      (chat_id, fecha.isoformat(), deporte)).fetchone()
+    return json.loads(f["datos"]) if f else None
+
+
+def consejos_desde(chat_id: int, desde: date) -> dict[tuple[str, str], dict]:
+    with conn() as c:
+        filas = c.execute("SELECT fecha, deporte, datos FROM consejos WHERE chat_id = ? "
+                          "AND fecha >= ?", (chat_id, desde.isoformat())).fetchall()
+    return {(f["fecha"], f["deporte"]): json.loads(f["datos"]) for f in filas}
+
+
+def ultimo_umbral(chat_id: int) -> int | None:
+    with conn() as c:
+        f = c.execute("SELECT fc_umbral FROM garmin_bienestar WHERE chat_id = ? AND fc_umbral "
+                      "IS NOT NULL ORDER BY fecha DESC LIMIT 1", (chat_id,)).fetchone()
+    return f["fc_umbral"] if f else None

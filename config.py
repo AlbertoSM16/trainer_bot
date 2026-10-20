@@ -63,11 +63,6 @@ GARMIN_TOKENS_DIR = os.path.expanduser(os.getenv("GARMIN_TOKENS_DIR", "~/.garmin
 GARMIN_CHAT_ID = int(os.getenv("GARMIN_CHAT_ID", "0") or 0)
 # Cada cuántos minutos se buscan actividades nuevas
 GARMIN_SYNC_MIN = int(os.getenv("GARMIN_SYNC_MIN", "15"))
-# Enviar las sesiones al calendario de Garmin (y al reloj) y cuántos días vista
-GARMIN_ENVIAR = os.getenv("GARMIN_ENVIAR", "1") == "1"
-GARMIN_DIAS_ENVIO = int(os.getenv("GARMIN_DIAS_ENVIO", "7"))
-# Ajustes automáticos: pesos de la rutina y sesión del día según Readiness/HRV/sueño
-GARMIN_AJUSTES = os.getenv("GARMIN_AJUSTES", "1") == "1"
 # Usar la predicción de media de Garmin para los ritmos cuando no hay un test reciente
 GARMIN_USAR_PREDICCION = os.getenv("GARMIN_USAR_PREDICCION", "1") == "1"
 # Un test vale para los ritmos durante estos días; después manda la predicción de Garmin
@@ -81,11 +76,18 @@ ATHLETE = {
     "peso_inicial_kg": 79.0,
     "marca_media": "4:38 min/km (marzo 2026)",
     "trabajo": "Ingeniero informático, trabaja de lunes a jueves de 8:00 a 17:30",
-    "objetivo": "Mejorar forma física y cardio y rendir al máximo corriendo, sin competir. "
-                "Subir a 81 kg ganando músculo y bajando algo el % de grasa.",
+    "objetivo": "Mejorar forma física y cardio y rendir al máximo en 10 km y media maratón "
+                "(sin fecha de carrera) y en bici. Subir a 81 kg ganando músculo y bajando "
+                "algo el % de grasa.",
 }
 
 # Mejor marca en media maratón (segundos por km). Mientras no haya un test registrado,
 # los ritmos salen de aquí más un margen por las semanas sin correr.
 MARCA_MEDIA_SEC = 4 * 60 + 38
 DESENTRENO_SEC = int(os.getenv("DESENTRENO_SEC", "15"))
+
+# Ejercicios como mucho en una sesión que junta grupos (~60'; soporte interno de plan.py)
+GYM_EJERCICIOS_SESION = 6
+
+# FC de umbral de lactato corriendo (ppm). 0 = la del reloj (Forerunner 265) o estimada
+FC_UMBRAL = int(os.getenv("FC_UMBRAL", "0"))

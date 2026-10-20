@@ -2,31 +2,33 @@
 
 Escriben primero en SQLite, luego sincronizan con Notion (best-effort) y devuelven el texto de
 respuesta en Markdown legacy de Telegram. Los errores de uso se lanzan como `ErrorUsuario`.
+
+No hay plan semanal fijo: lo entrenado sale del reloj (Garmin) y cada día `consejo.py` propone
+qué hacer en carrera y en bici.
 """
 import asyncio
 import logging
 import re
-import shlex
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import alimentos
 import compra
+import consejo
 import db
 import entrenador
 import garmin
-import garmin_ejercicios
-import gym
 import menu
 import mercadona
 import notion_sync
 import nutricion
 import plan
-from config import (ATHLETE, GARMIN_AJUSTES, GARMIN_CHAT_ID, GARMIN_DIAS_ENVIO,
-                    GARMIN_USAR_PREDICCION, PESO_OBJETIVO, TEST_VIGENCIA_DIAS, TIMEZONE)
+from config import (ATHLETE, FC_UMBRAL, GARMIN_CHAT_ID, GARMIN_USAR_PREDICCION, PESO_OBJETIVO,
+                    TEST_VIGENCIA_DIAS, TIMEZONE)
 
 TZ = ZoneInfo(TIMEZONE)
 log = logging.getLogger(__name__)
+DEPORTES = ("carrera", "bici")
 
 
 class ErrorUsuario(Exception):
@@ -47,64 +49,6 @@ def lunes(d: date) -> date:
 
 def nombre(d: date) -> str:
     return plan.DIAS[d.weekday()]
-
-
-# ---------- plan y cambios ----------
-
-def cambios(chat_id: int, desde: date, hasta: date) -> dict[date, plan.Cambio]:
-    return {d: plan.Cambio(o, m) for d, (o, m) in db.cambios_entre(chat_id, desde, hasta).items()}
-
-
-def cambio(chat_id: int, d: date) -> plan.Cambio | None:
-    return cambios(chat_id, d, d).get(d)
-
-
-def cambios_semana(chat_id: int, d: date) -> dict[date, plan.Cambio]:
-    return cambios(chat_id, lunes(d), lunes(d) + timedelta(days=6))
-
-
-def guardar(chat_id: int, nuevos: dict[date, plan.Cambio | None]):
-    db.guardar_cambios(chat_id, {d: (c.origen, c.modo) if c else None for d, c in nuevos.items()})
-
-
-def _linea_ejercicio(f) -> str:
-    if f["reps_max"]:
-        reps = (f"{f['reps_min']}" if f["reps_min"] == f["reps_max"] else
-                f"{f['reps_min']}-{f['reps_max']}")
-        txt = f"{f['series']}x{reps}"
-    else:
-        txt = f"{f['series']} series"
-    if f["peso_kg"] is not None:
-        txt += f" · {f['peso_kg']:g} kg"
-    if f["nota"]:
-        txt += f" ({menu._md(f['nota'])})"
-    return f"`#{f['id']}` {menu._md(f['ejercicio'])} — {txt}"
-
-
-def rutinas(chat_id: int) -> dict:
-    """Rutina propia en el formato de `gym.formatear`: {grupo: {variante: {...}}}.
-    Los ejercicios sin variante valen para A y B."""
-    filas = db.rutina(chat_id)
-    out = {}
-    for grupo in dict.fromkeys(f["grupo"] for f in filas):
-        fg = [f for f in filas if f["grupo"] == grupo]
-        con_variante = any(f["variante"] for f in fg)
-        out[grupo] = {}
-        for v in ("A", "B"):
-            fv = [f for f in fg if f["variante"] in (None, v)] or fg
-            out[grupo][v] = {
-                "titulo": gym.titulo(grupo).upper() + (f" {v}" if con_variante else ""),
-                "ejercicios": [_linea_ejercicio(f) for f in fv],
-                "filas": [dict(f) for f in fv],
-            }
-    return out
-
-
-def estructura(chat_id: int) -> plan.Estructura:
-    dias = db.semana_usuario(chat_id)
-    base = (tuple(tuple(dias[i]) for i in range(7)) if dias else
-            plan.ESTRUCTURA_DEFECTO.dias)
-    return plan.Estructura(base, rutinas(chat_id))
 
 
 _DIAS_NORM = {alimentos.normalizar(n): i for i, n in enumerate(plan.DIAS)}
@@ -132,23 +76,7 @@ def parse_dia(texto: str) -> date | None:
     return None
 
 
-def error_dia(d: date | None) -> str | None:
-    if d is None:
-        return "No entiendo el día. Usa `hoy`, `mañana` o un día de esta semana (`lunes`…`domingo`)."
-    if d < hoy():
-        return "Ese día ya ha pasado: solo puedo cambiar de hoy en adelante."
-    if plan.datos_semana(plan.semana_indice(d)) is None:
-        return "Ese día está fuera del plan."
-    return None
-
-
-def dia_cambiable(texto: str | None) -> date:
-    d = parse_dia(texto or "hoy")
-    error = error_dia(d)
-    if error:
-        raise ErrorUsuario(error)
-    return d
-
+# ---------- ritmos y pulso ----------
 
 def ritmo(chat_id: int) -> tuple[int, str]:
     """Ritmo de referencia (media, s/km) del usuario y de dónde sale: un test reciente, si no
@@ -167,91 +95,242 @@ def ritmo(chat_id: int) -> tuple[int, str]:
                               "con margen por el parón. Se ajustan con tu primer test.")
 
 
-def sesion(chat_id: int, d: date) -> dict:
-    """Sesión del día con los cambios, el ritmo y la semana tipo del usuario."""
-    return plan.sesiones_dia(d, cambio(chat_id, d), ritmo(chat_id)[0], estructura(chat_id))
+def umbral(chat_id: int) -> tuple[int | None, str]:
+    """FC de umbral de lactato corriendo y de dónde sale (`.env`, reloj o estimada)."""
+    if FC_UMBRAL:
+        return FC_UMBRAL, "puesta en `.env`"
+    u = db.ultimo_umbral(chat_id)
+    if u:
+        return u, "medida por tu reloj"
+    maximos = [a["fc_max"] for a in db.actividades(chat_id, hoy() - timedelta(days=60), 300)
+               if a.get("tipo") in ("carrera", "bici") and a.get("fc_max")]
+    if maximos:
+        return round(0.9 * max(maximos)), "estimada (90 % de tu FC máxima de los últimos 2 meses)"
+    return None, ""
 
 
-def formatear_dia(chat_id: int, d: date) -> str:
-    return plan.formatear_dia(d, cambio(chat_id, d), ritmo(chat_id)[0], estructura(chat_id))
+def umbral_fiable(chat_id: int) -> int | None:
+    """Umbral para clasificar sesiones duras por pulso: solo el medido o puesto a mano (el
+    estimado puede quedarse corto si solo hay rodajes y lo marcaría todo como duro)."""
+    u, fuente = umbral(chat_id)
+    return None if fuente.startswith("estimada") else u
 
 
-def resumen_semana(chat_id: int, week_num: int) -> str:
-    l = plan.fecha_lunes(week_num)
-    return plan.resumen_semana(week_num, cambios(chat_id, l, l + timedelta(days=6)),
-                               estructura(chat_id))
+# ---------- consejo de carrera y bici ----------
+
+def estado(chat_id: int) -> consejo.Estado:
+    h = hoy()
+    b = db.bienestar(chat_id, h)
+    sens = db.sensaciones_desde(chat_id, h - timedelta(days=1))
+    de_hoy = [s for s in sens if s["fecha"] == h.isoformat()]
+    energia = next((s["energia"] for s in reversed(de_hoy) if s["energia"] is not None), None)
+    # La última molestia anotada hoy manda; si hoy no hay nada, vale la de ayer.
+    ultima = de_hoy[-1] if de_hoy else (sens[-1] if sens else None)
+    molestia = consejo.zona_molestia(ultima["molestias"]) if ultima else "ninguna"
+    return consejo.Estado(
+        hoy=h, actividades=db.actividades(chat_id, h - timedelta(days=60), 300),
+        bienestar=dict(b) if b else {}, energia=energia, molestia=molestia,
+        umbral=umbral_fiable(chat_id), umbral_zonas=umbral(chat_id)[0], consejos=db.consejos_desde(chat_id, h - timedelta(days=60)))
 
 
-def resultado(chat_id: int, dias: list[date]) -> str:
-    cs = cambios_semana(chat_id, dias[0])
-    est = estructura(chat_id)
-    out = [f"• *{nombre(d)}*: {plan.sesiones_dia(d, cs.get(d), None, est)['titulo']}"
-           for d in sorted(set(dias))]
-    avisos = plan.avisos_semana(lunes(dias[0]), cs, est)
-    if avisos:
-        out += [""] + [f"⚠️ {a}" for a in avisos]
-    return "\n".join(out)
+def calcular_consejo(chat_id: int, deporte: str) -> consejo.Consejo:
+    """Consejo de hoy para `deporte`; lo guarda (salvo «ya hecho») para el reloj y el análisis."""
+    if deporte not in DEPORTES:
+        raise ErrorUsuario("El deporte tiene que ser `carrera` o `bici`.")
+    e = estado(chat_id)
+    c = consejo.carrera(e, ritmo(chat_id)[0]) if deporte == "carrera" else consejo.bici(e)
+    if c.clave != "hecho":
+        db.alta_usuario(chat_id, "atleta")
+        db.guardar_consejo(chat_id, e.hoy, c.datos())
+    return c
 
 
-CLAVE = {"carrera": "carrera de la semana", "pierna": "sesión de pierna"}
-MODOS_TEXTO = {"corta": "corta", "suave": "suave", "bici": "bici", "natacion": "natacion",
-               "nadar": "natacion", "descanso": "descanso", "normal": None}
+def consejo_texto(chat_id: int, deporte: str) -> tuple[str, bool]:
+    """Texto del consejo de hoy y si se puede mandar al reloj."""
+    c = calcular_consejo(chat_id, deporte)
+    texto = consejo.formatear(c)
+    if not garmin_activo(chat_id):
+        texto += "\n\n_Sin Garmin solo tengo en cuenta tus /sensaciones._"
+    elif deporte == "bici" and c.pasos and not umbral(chat_id)[0]:
+        texto += ("\n\n_Aún no conozco tu FC de umbral: te marco las zonas por sensaciones. "
+                  "Ponla con `FC_UMBRAL` en `.env` o deja que el reloj la mida._")
+    return texto, c.para_reloj and garmin_activo(chat_id)
 
 
-def mover(chat_id: int, texto_a: str, texto_b: str) -> str:
-    a, b = dia_cambiable(texto_a), dia_cambiable(texto_b)
-    if a == b:
-        raise ErrorUsuario("Son el mismo día.")
-    if lunes(a) != lunes(b):
-        raise ErrorUsuario("Solo puedo mover sesiones dentro de la misma semana (de lunes a domingo).")
-    guardar(chat_id, plan.mover(cambios_semana(chat_id, a), a, b))
-    return "🔀 *Semana cambiada*\n\n" + resultado(chat_id, [a, b])
-
-
-def saltar(chat_id: int, texto: str | None = None) -> str:
-    d = dia_cambiable(texto)
-    cs = cambios_semana(chat_id, d)
-    if plan.efectivo(cs, d).modo == "descanso":
-        return f"El {nombre(d).lower()} ya es de descanso."
-    est = estructura(chat_id)
-    clave = CLAVE.get(plan.carga_dia(d, cs, est))
-    guardar(chat_id, plan.cambiar(cs, d, "descanso"))
-    out = [f"⏭️ *{nombre(d)}*: descanso."]
-    if clave:
-        hueco = plan.sugerir_recuperacion(cambios_semana(chat_id, d), d, hoy(), est)
-        out.append(f"\nEra tu *{clave}*.")
-        if hueco:
-            out.append(f"💡 Puedes recuperarla el {nombre(hueco).lower()}: "
-                       f"`/mover {nombre(d).lower()} {nombre(hueco).lower()}`")
-        else:
-            out.append("Esta semana no queda hueco sin sobrecargarte: mejor dejarla.")
-    return "\n".join(out)
-
-
-def cambiar(chat_id: int, modo_texto: str, texto_dia: str | None = None) -> str:
-    modo_n = alimentos.normalizar(modo_texto or "")
-    if modo_n not in MODOS_TEXTO:
-        raise ErrorUsuario("Usa `/cambiar corta|suave|bici|natacion [día]`. "
-                           "`/cambiar normal` vuelve a la sesión original.")
-    d = dia_cambiable(texto_dia)
-    guardar(chat_id, plan.cambiar(cambios_semana(chat_id, d), d, MODOS_TEXTO[modo_n]))
-    if d == hoy():
-        return formatear_dia(chat_id, d)
-    return "✅ " + resultado(chat_id, [d])
-
-
-def deshacer(chat_id: int, texto: str | None = None) -> str:
-    arg = alimentos.normalizar(texto or "hoy")
-    if arg == "semana":
-        cs = cambios_semana(chat_id, hoy())
-        nuevos = {d: None for d in cs if d >= hoy()}
+async def mandar_reloj(chat_id: int, deporte: str) -> str:
+    """Sube el consejo de hoy al calendario de Garmin (sustituye al anterior de ese deporte)."""
+    _exigir_garmin(chat_id)
+    h = hoy()
+    datos = db.consejo(chat_id, h, deporte)
+    if not datos or not datos.get("pasos"):
+        raise ErrorUsuario(f"Hoy no tengo un entreno de {deporte} para el reloj. Pide antes "
+                           f"/{deporte}.")
+    n = f"{garmin.PREFIJO} {h:%d/%m} {datos['titulo']}"
+    if deporte == "carrera":
+        j = garmin.json_carrera(n, datos, ritmo(chat_id)[0])
     else:
-        d = dia_cambiable(arg)
-        nuevos = plan.deshacer(cambios_semana(chat_id, d), d)
-    if not nuevos:
-        return "No hay cambios que deshacer."
-    guardar(chat_id, nuevos)
-    return "↩️ *Plan original*\n\n" + resultado(chat_id, list(nuevos))
+        u = umbral(chat_id)[0]
+        j = garmin.json_bici(n, datos, consejo.zonas_bici(u) if u else None)
+    for r in db.programados(chat_id, h, h):
+        if r["clave"] == deporte:
+            try:
+                await _g(garmin.borrar, r["workout_id"])
+            except Exception as e:  # noqa: BLE001
+                log.info("Garmin: no se pudo borrar %s: %s", r["workout_id"], e)
+            db.borrar_programado(chat_id, r["fecha"], r["clave"])
+    wid = await _g(garmin.subir, j)
+    await _g(garmin.programar, wid, h)
+    db.guardar_programado(chat_id, h, deporte, wid, garmin.huella(j))
+    return (f"⌚ *{menu._md(datos['titulo'])}* está en el calendario de hoy.\n"
+            "_Sincroniza el reloj con Garmin Connect y búscalo en Entrenamiento > Calendario._")
+
+
+async def limpiar_reloj(chat_id: int) -> int:
+    """Quita del calendario los entrenos que puso el bot otros días (incluidos los del plan
+    semanal antiguo). Devuelve cuántos quita."""
+    h = hoy()
+    n = 0
+    for r in db.programados(chat_id):
+        if r["fecha"] == h.isoformat() and r["clave"] in DEPORTES:
+            continue
+        try:
+            await _g(garmin.borrar, r["workout_id"])
+        except Exception as e:  # noqa: BLE001
+            log.info("Garmin: no se pudo borrar %s: %s", r["workout_id"], e)
+        db.borrar_programado(chat_id, r["fecha"], r["clave"])
+        n += 1
+    return n
+
+
+# ---------- historial ----------
+
+ICONO = {"carrera": "🏃", "gym": "🏋️", "natacion": "🏊", "bici": "🚴"}
+
+
+def _duracion(minutos: float) -> str:
+    h, m = divmod(round(minutos), 60)
+    return f"{h}h{m:02d}'" if h else f"{m}'"
+
+
+def _linea(a: dict, u: int | None) -> str:
+    partes = []
+    if a.get("distancia_m") and a["tipo"] != "gym":
+        partes.append(f"{a['distancia_m'] / 1000:.1f} km")
+    if a.get("duracion_s"):
+        partes.append(_duracion(a["duracion_s"] / 60))
+    if a["tipo"] == "carrera" and a.get("distancia_m") and a.get("duracion_s"):
+        partes.append(f"{plan.pace(round(a['duracion_s'] / (a['distancia_m'] / 1000)))} /km")
+    if a.get("fc_media"):
+        partes.append(f"FC {round(a['fc_media'])}")
+    if a.get("te_aerobico"):
+        partes.append(f"TE {a['te_aerobico']:.1f}/{a.get('te_anaerobico') or 0:.1f}")
+    etiqueta = (" 🛣️ larga" if consejo.larga(a) else " 🔥 dura" if consejo.dura(a, u) else "")
+    return (f"{ICONO.get(a['tipo'], '⌚')} {menu._md(a.get('nombre') or a['tipo'])}{etiqueta}: "
+            + " · ".join(partes))
+
+
+def _previas(gyms: list[dict]) -> dict[int, dict[str, list[dict]]]:
+    """Para cada sesión de fuerza, las series de la última vez que se hizo cada ejercicio."""
+    out, visto = {}, {}
+    for a in sorted(gyms, key=lambda x: (x["fecha"], x.get("hora") or "")):
+        out[a["id"]] = dict(visto)
+        visto.update(entrenador.por_ejercicio(a.get("series") or []))
+    return out
+
+
+def historial_texto(chat_id: int, dias: int = 14) -> str:
+    h = hoy()
+    desde = h - timedelta(days=dias - 1)
+    todas = db.actividades(chat_id, h - timedelta(days=120), 500)
+    acts = sorted((a for a in todas if a["fecha"] >= desde.isoformat()),
+                  key=lambda a: (a["fecha"], a.get("hora") or ""))
+    if not acts:
+        return ("📅 No tengo actividades de los últimos 14 días. "
+                + ("Prueba /garmin para sincronizar." if garmin_activo(chat_id) else
+                   "Conecta tu Garmin (ver README)."))
+    u = umbral_fiable(chat_id)
+    previas = _previas([a for a in todas if a["tipo"] == "gym"])
+    out = [f"📅 *Historial · últimos {dias} días*"]
+    inicio = lunes(desde)
+    while inicio <= h:
+        fin = inicio + timedelta(days=6)
+        semana = [a for a in acts if inicio.isoformat() <= a["fecha"] <= fin.isoformat()]
+        out += ["", _totales(inicio, semana, u) if semana else
+                f"*Semana del {inicio:%d/%m}* — sin actividades"]
+        for i in range(7):
+            d = inicio + timedelta(days=i)
+            if d < desde or d > h:
+                continue
+            del_dia = [a for a in semana if a["fecha"] == d.isoformat()]
+            cab = f"*{nombre(d)[:3]} {d:%d/%m}*"
+            if not del_dia:
+                out.append(f"{cab} · descanso")
+                continue
+            out.append(cab)
+            for a in del_dia:
+                out.append(_linea(a, u))
+                if a["tipo"] == "gym":
+                    if a.get("series"):
+                        out += ["  " + x for x in
+                                entrenador.resumen_fuerza(a["series"], previas.get(a["id"], {}))]
+                    else:
+                        out.append("  _(sin series registradas)_")
+        inicio += timedelta(days=7)
+    return "\n".join(out)
+
+
+def _totales(lun: date, acts: list[dict], u: int | None) -> str:
+    def suma(tipo, campo):
+        return sum((a.get(campo) or 0) for a in acts if a["tipo"] == tipo)
+    partes = []
+    carreras = [a for a in acts if a["tipo"] == "carrera"]
+    if carreras:
+        partes.append(f"🏃 {len(carreras)} · {suma('carrera', 'distancia_m') / 1000:.1f} km")
+    bicis = [a for a in acts if a["tipo"] == "bici"]
+    if bicis:
+        partes.append(f"🚴 {len(bicis)} · {_duracion(suma('bici', 'duracion_s') / 60)}")
+    gyms = [a for a in acts if a["tipo"] == "gym"]
+    if gyms:
+        partes.append(f"🏋️ {len(gyms)}")
+    otras = len(acts) - len(carreras) - len(bicis) - len(gyms)
+    if otras:
+        partes.append(f"⌚ {otras} más")
+    duras = sum(1 for a in acts if consejo.dura(a, u))
+    total = sum((a.get("duracion_s") or 0) for a in acts) / 60
+    return (f"*Semana del {lun:%d/%m}* — " + " · ".join(partes)
+            + f" · {_duracion(total)} en total · {duras} dura{'s' if duras != 1 else ''}")
+
+
+def stats_texto(chat_id: int) -> str:
+    hist = db.historico_metricas(chat_id, 8)
+    out = ["📊 *Tu progreso*", ""]
+    if hist:
+        out.append("*Métricas recientes*")
+        for r in hist:
+            partes = [r["fecha"]]
+            if r["peso"] is not None:
+                partes.append(f"{r['peso']} kg")
+            if r["grasa"] is not None:
+                partes.append(f"{r['grasa']}% grasa")
+            out.append("• " + " · ".join(partes))
+        pesos = [r["peso"] for r in hist if r["peso"] is not None]
+        if len(pesos) >= 2:
+            out.append(f"\nVariación de peso en el periodo: {pesos[0] - pesos[-1]:+.1f} kg")
+    else:
+        out.append("Aún no has registrado peso ni grasa. Usa /peso y /grasa.")
+    h = hoy()
+    acts = db.actividades(chat_id, h - timedelta(days=27), 300)
+    if acts:
+        u = umbral_fiable(chat_id)
+        out += ["", "*Últimas 4 semanas*"]
+        for i in range(3, -1, -1):
+            lun = lunes(h) - timedelta(days=7 * i)
+            semana = [a for a in acts if lun.isoformat() <= a["fecha"]
+                      <= (lun + timedelta(days=6)).isoformat()]
+            if semana:
+                out.append("• " + _totales(lun, semana, u).replace("*", ""))
+        out.append("\nDetalle día a día: /historial")
+    return "\n".join(out)
 
 
 # ---------- sensaciones ----------
@@ -260,39 +339,29 @@ def registrar_sensaciones(chat_id: int, energia: int | None, molestias: str = ""
                           nota: str = "") -> str:
     if energia is not None and not 1 <= energia <= 5:
         raise ErrorUsuario("La energía va de 1 (fundido) a 5 (a tope).")
+    db.alta_usuario(chat_id, "atleta")
     db.guardar_sensaciones(chat_id, hoy(), energia, molestias, nota)
     return "📝 Sensaciones anotadas."
 
 
-def aplicar_sensaciones(chat_id: int, energia: int, zona: str) -> str:
-    """Reglas sin IA: anota las sensaciones y adapta la sesión de hoy si hace falta."""
-    d = hoy()
+def aplicar_sensaciones(chat_id: int, energia: int, zona: str) -> tuple[str, list[str]]:
+    """Anota las sensaciones y devuelve el consejo de hoy de carrera y bici ya con ellas
+    (y los deportes que se pueden mandar al reloj)."""
     registrar_sensaciones(chat_id, energia, plan.ZONAS_MOLESTIA.get(zona, zona))
-    if plan.datos_semana(plan.semana_indice(d)) is None:
-        return "📝 Anotado. Hoy aún no hay plan."
-    cs = cambios_semana(chat_id, d)
-    est = estructura(chat_id)
-    modo, motivo = plan.recomendar(d, cs, energia, zona, est)
-    out = [f"📝 Energía {energia}/5 · {plan.ZONAS_MOLESTIA.get(zona, zona)}", "", f"💡 {motivo}"]
-    if modo:
-        guardar(chat_id, plan.cambiar(cs, d, modo))
-        out += ["", formatear_dia(chat_id, d)]
-        if modo == "descanso":
-            clave = CLAVE.get(plan.carga_dia(d, cs, est))
-            hueco = clave and plan.sugerir_recuperacion(cambios_semana(chat_id, d), d, d, est)
-            if hueco:
-                out += ["", f"💡 La {clave} se puede recuperar el {nombre(hueco).lower()}: "
-                            f"`/mover {nombre(d).lower()} {nombre(hueco).lower()}`"]
-        out += ["", "_Si mejoras, `/deshacer` vuelve a la sesión original._"]
-    elif (c := cs.get(d)) and c.modo:
-        out += ["", "_Hoy ya tenías la sesión cambiada; `/deshacer` vuelve a la original._"]
+    out = [f"📝 Energía {energia}/5 · {plan.ZONAS_MOLESTIA.get(zona, zona)}"]
+    reloj = []
+    for deporte in DEPORTES:
+        texto, para_reloj = consejo_texto(chat_id, deporte)
+        out += ["", texto]
+        if para_reloj:
+            reloj.append(deporte)
     if zona != "ninguna":
         out += ["", "_Si es un dolor agudo, punzante o dura más de una semana, consulta a "
                     "un fisio o médico._"]
-    return "\n".join(out)
+    return "\n".join(out), reloj
 
 
-# ---------- métricas, entrenos y tests ----------
+# ---------- métricas y tests ----------
 
 async def registrar_metrica(chat_id: int, campo: str, valor: float) -> str:
     if campo == "peso" and not 40 <= valor <= 150:
@@ -316,38 +385,6 @@ async def registrar_metrica(chat_id: int, campo: str, valor: float) -> str:
         hoy(), fila["peso"] if fila else None, fila["grasa"] if fila else None, imc)
     sufijo = "\n📓 Guardado también en Notion." if ok else ""
     return f"✅ Registrado: {campo} = {valor:g} {unidad}{extra}{sufijo}"
-
-
-async def guardar_entreno(chat_id: int, d: date, titulo: str, nota: str = "") -> bool:
-    """Guarda un entreno hecho en SQLite y Notion. Devuelve si se guardó en Notion."""
-    c = cambio(chat_id, d)
-    est = estructura(chat_id)
-    s = plan.sesiones_dia(d, c, None, est)
-    db.marcar_hecho(chat_id, d, titulo, nota)
-    return await notion_sync.sync.guardar_entreno(
-        fecha=d, titulo=titulo, nota=nota, semana=s["semana"],
-        fase=plan.fase_nombre_corto(s["fase"]), dia=nombre(d),
-        tipos=plan.tipos_dia(d, c, est), descarga=bool(s.get("descarga")))
-
-
-async def marcar_hecho(chat_id: int, nota: str = "") -> str:
-    d = hoy()
-    c = cambio(chat_id, d)
-    est = estructura(chat_id)
-    s = plan.sesiones_dia(d, c, None, est)
-    if s["fuera_de_plan"]:
-        raise ErrorUsuario("Hoy no hay sesión planificada todavía. El plan arranca el "
-                           f"{plan.PLAN_START.strftime('%d/%m/%Y')}.")
-    if (c and c.modo == "descanso") or (not c and est.descanso(d.weekday())):
-        raise ErrorUsuario("Hoy tienes descanso 😴. Si al final entrenas, cambia el día "
-                           "(`/mover` o `/deshacer`) y luego marca /hecho.")
-    ok = await guardar_entreno(chat_id, d, s["titulo"], nota)
-    msg = f"✅ Anotado: *{s['titulo']}*"
-    if nota:
-        msg += f"\n📝 {menu._md(nota)}"
-    if ok:
-        msg += "\n📓 Guardado también en Notion."
-    return msg + "\n\n¡Buen trabajo! 💪"
 
 
 def parse_distancia(texto: str) -> float:
@@ -377,6 +414,7 @@ def registrar_test(chat_id: int, km: float, segundos: int) -> str:
     if not 150 <= ritmo_km <= 600:
         raise ErrorUsuario("Ese tiempo da un ritmo poco realista. Revisa distancia y tiempo.")
     antes, _ = ritmo(chat_id)
+    db.alta_usuario(chat_id, "atleta")
     db.guardar_test(chat_id, hoy(), km, segundos)
     ref, fuente = ritmo(chat_id)
     dif = ref - antes
@@ -389,16 +427,55 @@ def registrar_test(chat_id: int, km: float, segundos: int) -> str:
         "", plan.tabla_ritmos(ref, fuente)])
 
 
+def ritmos_texto(chat_id: int) -> str:
+    out = plan.tabla_ritmos(*ritmo(chat_id))
+    u, fuente = umbral(chat_id)
+    if u:
+        z = consejo.zonas_bici(u)
+        out += ("\n\n🚴 *Zonas de bici* (FC de umbral corriendo " f"{u} ppm, {fuente})\n"
+                + "\n".join(f"• {consejo.ZONAS_BICI[k][2]}: {a}-{b} ppm" for k, (a, b) in z.items()))
+    return out
+
+
 # ---------- dieta ----------
 
 def peso_actual(chat_id: int) -> float:
     return db.ultimo_peso(chat_id) or ATHLETE["peso_inicial_kg"]
 
 
-def objetivo(chat_id: int, d: date) -> nutricion.Objetivo:
+def kcal_ejercicio(chat_id: int) -> int | None:
+    """Media diaria de kcal de ejercicio del reloj (14 días previos a hoy). None sin Garmin o
+    sin actividades: la dieta usa entonces la media estimada de una semana tipo."""
+    if not garmin_activo(chat_id) or not db.hay_actividades(chat_id):
+        return None
+    h = hoy()
+    acts = [a for a in db.actividades(chat_id, h - timedelta(days=14), 300)
+            if a["fecha"] < h.isoformat()]
+    return nutricion.kcal_ejercicio_reloj(acts, peso_actual(chat_id))
+
+
+def entreno_de_hoy(chat_id: int) -> str | None:
+    """`deporte:clave` del entreno aconsejado hoy (para el consejo de comida)."""
+    h = hoy()
+    for deporte in DEPORTES:
+        c = db.consejo(chat_id, h, deporte)
+        if c and c["clave"] not in ("descanso", "hecho"):
+            return f"{deporte}:{c['clave']}"
+    return None
+
+
+def _objetivos(chat_id: int, desde: date) -> list[nutricion.Objetivo]:
     ajuste, _ = db.ajuste_kcal(chat_id)
-    return nutricion.objetivo_dia(d, peso_actual(chat_id), ajuste, cambio(chat_id, d),
-                                  estructura(chat_id))
+    h, peso = hoy(), peso_actual(chat_id)
+    kcal = kcal_ejercicio(chat_id)
+    return nutricion.objetivos_semana(
+        desde, peso, ajuste,
+        ejercicio_kcal=kcal if kcal is not None else nutricion.kcal_ejercicio_estimada(peso, h),
+        entrenos={h: entreno_de_hoy(chat_id)}, reloj=kcal is not None)
+
+
+def objetivo(chat_id: int, d: date) -> nutricion.Objetivo:
+    return _objetivos(chat_id, d)[0]
 
 
 def dieta_texto(chat_id: int, d: date) -> str:
@@ -409,14 +486,10 @@ def _menus_semana(chat_id: int, d: date) -> tuple[date, list[nutricion.Objetivo]
                                                    dict[date, dict[str, str]]]:
     """Objetivos y variante de proteína de la semana de compra (sábado a viernes) de `d`,
     con la misma variante que elegiría la lista de la compra (precios en caché)."""
-    ajuste, _ = db.ajuste_kcal(chat_id)
     sabado = d - timedelta(days=(d.weekday() - 5) % 7)
-    domingo = sabado + timedelta(days=6)
-    cs = cambios(chat_id, sabado, domingo)
-    platos = db.platos_entre(chat_id, sabado, domingo)
+    platos = db.platos_entre(chat_id, sabado, sabado + timedelta(days=6))
     opciones = {k: mercadona.candidatos(a) for k, a in alimentos.disponibles().items()}
-    objetivos = nutricion.objetivos_semana(sabado, peso_actual(chat_id), ajuste, cs,
-                                           estructura(chat_id))
+    objetivos = _objetivos(chat_id, sabado)
     variante = compra.construir(objetivos, opciones, platos).variante
     return sabado, objetivos, variante, platos
 
@@ -436,10 +509,7 @@ def menu_semana_texto(chat_id: int, d: date) -> str:
 async def lista_compra(chat_id: int) -> str:
     await mercadona.actualizar()
     h = hoy()
-    ajuste, _ = db.ajuste_kcal(chat_id)
-    cs = cambios(chat_id, h, h + timedelta(days=6))
-    objetivos = nutricion.objetivos_semana(h, peso_actual(chat_id), ajuste, cs,
-                                           estructura(chat_id))
+    objetivos = _objetivos(chat_id, h)
     opciones = {k: mercadona.candidatos(a) for k, a in alimentos.disponibles().items()}
     platos = db.platos_entre(chat_id, h, h + timedelta(days=6))
     return compra.formatear(compra.construir(objetivos, opciones, platos))
@@ -484,6 +554,7 @@ def cambiar_plato(chat_id: int, texto_dia: str | None, comida: str, plato: str |
     if not c:
         raise ErrorUsuario("La comida tiene que ser `desayuno`, `comida`, `merienda` o `cena`.")
     clave = alimentos.normalizar(plato or "normal").replace(" ", "_")
+    db.alta_usuario(chat_id, "atleta")
     if clave == "normal":
         db.guardar_plato(chat_id, d, c, None)
         return f"↩️ {nombre(d)}: {c} vuelve al plato del plan.\n\n" + menu_texto(chat_id, d)
@@ -493,7 +564,7 @@ def cambiar_plato(chat_id: int, texto_dia: str | None, comida: str, plato: str |
     return f"🔁 {nombre(d)}: plato de {c} cambiado.\n\n" + menu_texto(chat_id, d)
 
 
-# ---------- perfil y bloque ----------
+# ---------- perfil ----------
 
 def perfil_texto(chat_id: int) -> str:
     p = peso_actual(chat_id)
@@ -501,358 +572,23 @@ def perfil_texto(chat_id: int) -> str:
                   if r["grasa"] is not None), None)
     imc = p / (ATHLETE["altura_cm"] / 100) ** 2
     ref, fuente = ritmo(chat_id)
-    estado = ("mantenimiento" if p >= PESO_OBJETIVO else
-              f"volumen limpio (+{nutricion.superavit(p)} kcal/día)")
+    u, fuente_u = umbral(chat_id)
+    estado_dieta = ("mantenimiento" if p >= PESO_OBJETIVO else
+                    f"volumen limpio (+{nutricion.superavit(p)} kcal/día)")
+    kcal = kcal_ejercicio(chat_id)
     return "\n".join([
         "👤 *Tu perfil*", "",
         f"• Edad: {ATHLETE['edad']} años · Altura: {ATHLETE['altura_cm']} cm",
         f"• Peso: {p:g} kg (IMC {imc:.1f}) → objetivo {PESO_OBJETIVO:g} kg",
         f"• Grasa corporal: {grasa if grasa is not None else '—'}%",
-        f"• Dieta: {estado}",
+        f"• Dieta: {estado_dieta}"
+        + (f" · ejercicio {kcal} kcal/día (media del reloj)" if kcal is not None else ""),
         f"• Mejor marca en media: {ATHLETE['marca_media']}",
         f"• Ritmo de media actual: {plan.pace(ref)} /km",
         f"  _{fuente}_",
+        f"• FC de umbral: {f'{u} ppm ({fuente_u})' if u else '—'}",
         "", f"🎯 _{ATHLETE['objetivo']}_",
     ])
-
-
-def bloque_texto(chat_id: int) -> str:
-    d = hoy()
-    wn = plan.semana_indice(d)
-    pt = plan.proximo_test(d, estructura(chat_id))
-    out = []
-    if wn >= 1:
-        out.append(f"Vas por la *semana {plan.semana_en_bloque(wn)}/{plan.SEMANAS_BLOQUE}* "
-                   f"del bloque {plan.bloque_de(wn)} (semana {wn} del plan).")
-    if pt:
-        test, km = pt
-        dias = (test - d).days
-        out.append(f"⏱️ Próximo test: *{km} km* el {nombre(test).lower()} "
-                   f"{test.strftime('%d/%m')} "
-                   + ("(¡hoy!)" if dias == 0 else f"(dentro de {dias} días)") + ".")
-    else:
-        out.append("⏱️ Sin día de carrera en tu semana tipo no hay tests (`/semana_config`).")
-    tests = db.tests(chat_id, 3)
-    if tests:
-        out.append("Últimos tests: " + " · ".join(
-            f"{t['km']:g} km en {plan.tiempo_txt(t['segundos'])} "
-            f"({date.fromisoformat(t['fecha']).strftime('%d/%m')})"
-            for t in tests))
-    if not pt:
-        return "\n".join(out)
-    return "\n".join(out) + "\n\n" + plan.resumen_bloque(wn, ritmo(chat_id)[0])
-
-
-# ---------- semana tipo ----------
-
-TIPOS_TEXTO = {"gym": "gym", "gimnasio": "gym", "carrera": "carrera", "correr": "carrera",
-               "natacion": "natacion", "nadar": "natacion", "piscina": "natacion",
-               "bici": "bici", "ciclismo": "bici", "descanso": "descanso", "libre": "descanso"}
-
-
-def _grupo_valido(g: str) -> str:
-    g = alimentos.normalizar(g).replace(" ", "_")
-    if not re.fullmatch(r"[a-z0-9_]{2,20}", g):
-        raise ErrorUsuario(f"«{g}» no vale como grupo: usa una palabra (pecho, torso, pierna…).")
-    return g
-
-
-def parse_items(texto: str, chat_id: int) -> list[tuple[str, str | None]]:
-    """«carrera + gym:hombro», «pecho», «descanso»… -> [(tipo, grupo)]."""
-    conocidos = set(gym.GRUPOS) | {f["grupo"] for f in db.rutina(chat_id)}
-    items = []
-    for tok in re.split(r"[+,\s]+", alimentos.normalizar(texto or "")):
-        if not tok:
-            continue
-        if tok.startswith(("gym:", "gimnasio:")):
-            items.append(("gym", _grupo_valido(tok.split(":", 1)[1])))
-        elif tok in TIPOS_TEXTO and TIPOS_TEXTO[tok] != "gym":
-            items.append((TIPOS_TEXTO[tok], None))
-        elif tok in conocidos:
-            items.append(("gym", tok))
-        else:
-            raise ErrorUsuario(f"No entiendo «{tok}». Usa carrera, natacion, bici, descanso o "
-                               "gym:grupo (por ejemplo `gym:pecho`).")
-    if not items:
-        raise ErrorUsuario("Dime qué lleva el día, por ejemplo `carrera+gym:hombro` o `descanso`.")
-    if len(items) > 1:
-        items = [i for i in items if i[0] != "descanso"] or [("descanso", None)]
-    return items
-
-
-def semana_config_texto(chat_id: int) -> str:
-    est = estructura(chat_id)
-    propia = db.semana_usuario(chat_id) is not None
-    out = ["🗓️ *Tu semana tipo*" + ("" if propia else " (la de por defecto)"), ""]
-    for i in range(7):
-        partes = [f"Gimnasio · {gym.titulo(g)}" if t == "gym" else plan.TIPOS[t]
-                  for t, g in est.items(i)]
-        out.append(f"*{plan.DIAS[i]}* — {' + '.join(partes)}")
-    sin_rutina = sorted({g for i in range(7) for g in est.grupos(i)}
-                        - set(est.rutinas) - set(gym.GRUPOS))
-    if sin_rutina:
-        out += ["", "⚠️ Grupos sin rutina: " + ", ".join(sin_rutina) + " (`/rutina_add`)."]
-    avisos = plan.avisos_estructura(est)
-    if avisos:
-        out += [""] + [f"⚠️ {a}" for a in avisos]
-    out += ["", "Cambia un día con `/dia_config sabado carrera+gym:hombro` (tipos: carrera, "
-                "natacion, bici, descanso, gym:grupo). `/semana_reset` vuelve a la de por "
-                "defecto."]
-    return "\n".join(out)
-
-
-def configurar_dia(chat_id: int, texto_dia: str, texto_items: str) -> str:
-    dow = _DIAS_NORM.get(alimentos.normalizar(texto_dia or ""))
-    if dow is None:
-        raise ErrorUsuario("Indica el día de la semana (`lunes`…`domingo`).")
-    est = estructura(chat_id)
-    dias = {i: list(est.dias[i]) for i in range(7)}
-    dias[dow] = parse_items(texto_items, chat_id)
-    db.guardar_semana(chat_id, dias)
-    return "✅ Semana tipo actualizada.\n\n" + semana_config_texto(chat_id)
-
-
-def reset_semana(chat_id: int) -> str:
-    db.guardar_semana(chat_id, None)
-    return "↩️ Vuelves a la semana por defecto.\n\n" + semana_config_texto(chat_id)
-
-
-# ---------- rutina propia ----------
-
-_SPEC = re.compile(r"(\d+)\s*x\s*(\d+)(?:\s*-\s*(\d+))?")
-_KG = re.compile(r"(\d+(?:[.,]\d+)?)\s*kg")
-_DESCANSO = re.compile(r"(\d+)\s*(s|seg|\"|'|min)")
-
-
-def _tokens(texto: str) -> list[str]:
-    """Separa por espacios respetando comillas (también las tipográficas del móvil).
-    `2'` y `90"` se leen como minutos y segundos de descanso."""
-    texto = (texto or "").translate(str.maketrans("“”«»‘’", "\"\"\"\"''"))
-    texto = re.sub(r"(\d)'", r"\1min", texto)
-    texto = re.sub(r"(\d)\"(?=\s|$)", r"\1s", texto)
-    try:
-        return shlex.split(texto)
-    except ValueError:
-        return [t.strip("\"'") for t in texto.split()]
-
-
-def _opcion(tok: str, campos: dict) -> bool:
-    """Interpreta un token de serie/peso/variante/descanso. Devuelve si lo ha reconocido."""
-    t = alimentos.normalizar(tok)
-    if m := _SPEC.fullmatch(t):
-        campos["series"], campos["reps_min"] = int(m.group(1)), int(m.group(2))
-        campos["reps_max"] = int(m.group(3) or m.group(2))
-        if campos["reps_max"] < campos["reps_min"]:
-            raise ErrorUsuario("El rango de repeticiones va de menos a más (`4x6-8`).")
-        return True
-    if m := _KG.fullmatch(t):
-        campos["peso_kg"] = float(m.group(1).replace(",", "."))
-        return True
-    if t in ("pc", "sinpeso", "sin_peso"):
-        campos["peso_kg"] = None
-        return True
-    if t in ("a", "b", "ab"):
-        campos["variante"] = None if t == "ab" else t.upper()
-        return True
-    if m := _DESCANSO.fullmatch(t):
-        n = int(m.group(1))
-        campos["descanso_s"] = n * 60 if m.group(2) in ("'", "min") else n
-        return True
-    return False
-
-
-def rutina_texto(chat_id: int, grupo: str | None = None) -> str:
-    filas = db.rutina(chat_id, _grupo_valido(grupo) if grupo else None)
-    if not filas:
-        if grupo and grupo in gym.GRUPOS:
-            return (f"No tienes rutina propia de {grupo}: uso la de por defecto.\n\n"
-                    + gym.formatear(grupo, "A") + "\n\n" + gym.formatear(grupo, "B")
-                    + f"\n\nCópiala para editarla: `/rutina_importar {grupo}`.")
-        return ("Aún no tienes rutina propia (uso la de por defecto).\n\n"
-                "• `/rutina_importar` copia la de por defecto para que la edites\n"
-                "• `/rutina_add pecho \"Press banca\" 4x6-8 80kg` añade un ejercicio\n"
-                "Opciones: `A`/`B` (variante; sin nada vale para las dos), `90s` o `2'` "
-                "de descanso, `pc` (peso corporal).")
-    out = ["🏋️ *Tu rutina*"]
-    for g in dict.fromkeys(f["grupo"] for f in filas):
-        out += ["", f"*{gym.titulo(g)}* (`{g}`)"]
-        for f in sorted((f for f in filas if f["grupo"] == g),
-                        key=lambda f: (f["variante"] or "", f["orden"], f["id"])):
-            var = f" [{f['variante']}]" if f["variante"] else ""
-            out.append(f"• {_linea_ejercicio(f)}{var}")
-    out += ["", "`/rutina_edit 12 85kg` · `/rutina_edit 12 4x8-10` · `/rutina_del 12` · "
-                "`/series 12 80x8 80x8 80x7`"]
-    return "\n".join(out)
-
-
-def anadir_ejercicio(chat_id: int, texto: str) -> str:
-    """`grupo "Nombre del ejercicio" 4x6-8 [80kg|pc] [A|B] [90s] [nota libre]`."""
-    tok = _tokens(texto)
-    if len(tok) < 3:
-        raise ErrorUsuario("Usa `/rutina_add pecho \"Press banca\" 4x6-8 80kg` "
-                           "(opcional: `A`/`B`, `90s` de descanso, `pc` para peso corporal).")
-    grupo = _grupo_valido(tok[0])
-    i = next((i for i, t in enumerate(tok[1:], 1) if _SPEC.fullmatch(alimentos.normalizar(t))),
-             None)
-    if i is None or i == 1:
-        raise ErrorUsuario("Falta el nombre o las series: `/rutina_add pecho \"Press banca\" 4x8`.")
-    nombre = " ".join(tok[1:i]).strip()
-    campos = {"grupo": grupo, "ejercicio": nombre, "garmin_cat": garmin_ejercicios.categoria(nombre),
-              "descanso_s": 90}
-    nota = []
-    for t in tok[i:]:
-        if not _opcion(t, campos):
-            nota.append(t)
-    if nota:
-        campos["nota"] = " ".join(nota)
-    nuevo = db.anadir_ejercicio(chat_id, **campos)
-    cat = campos["garmin_cat"] or "sin categoría (el reloj lo registrará como genérico)"
-    return (f"➕ Añadido `#{nuevo}` a {gym.titulo(grupo)} · Garmin: {cat}\n\n"
-            + rutina_texto(chat_id, grupo))
-
-
-def _fila(chat_id: int, texto_id: str):
-    try:
-        rid = int(str(texto_id).lstrip("#"))
-    except ValueError:
-        raise ErrorUsuario("Indica el número del ejercicio (lo ves en /rutina).") from None
-    f = db.ejercicio(chat_id, rid)
-    if f is None:
-        raise ErrorUsuario(f"No tienes ningún ejercicio #{rid}. Mira /rutina.")
-    return f
-
-
-def editar_ejercicio(chat_id: int, texto: str) -> str:
-    """`id [4x8-10] [85kg|pc] [A|B|AB] [90s] [nombre "…"] [nota …] [grupo x] [orden n]`."""
-    tok = _tokens(texto)
-    if len(tok) < 2:
-        raise ErrorUsuario("Usa `/rutina_edit 12 85kg` (o `4x8-10`, `A`, `90s`, "
-                           "`nombre \"Press inclinado\"`, `nota …`, `grupo torso`, `orden 2`).")
-    f = _fila(chat_id, tok[0])
-    campos: dict = {}
-    resto = tok[1:]
-    while resto:
-        t = resto.pop(0)
-        clave = alimentos.normalizar(t)
-        if clave in ("nombre", "nota"):
-            valor = " ".join(resto).strip()
-            resto = []
-            if clave == "nombre":
-                if not valor:
-                    raise ErrorUsuario("Falta el nombre nuevo.")
-                campos["ejercicio"] = valor
-                campos["garmin_cat"] = garmin_ejercicios.categoria(valor)
-            else:
-                campos["nota"] = valor or None
-        elif clave == "grupo" and resto:
-            campos["grupo"] = _grupo_valido(resto.pop(0))
-        elif clave == "orden" and resto and resto[0].isdigit():
-            campos["orden"] = int(resto.pop(0))
-        elif not _opcion(t, campos):
-            raise ErrorUsuario(f"No entiendo «{t}».")
-    if "peso_kg" in campos:
-        campos["fallos"] = 0
-    db.editar_ejercicio(chat_id, f["id"], **campos)
-    return "✏️ Ejercicio actualizado.\n\n" + rutina_texto(chat_id, campos.get("grupo", f["grupo"]))
-
-
-def borrar_ejercicio(chat_id: int, texto_id: str) -> str:
-    f = _fila(chat_id, texto_id)
-    db.borrar_ejercicio(chat_id, f["id"])
-    return f"🗑️ Quitado: {menu._md(f['ejercicio'])}."
-
-
-def borrar_rutina_grupo(chat_id: int, grupo: str) -> str:
-    n = db.borrar_grupo(chat_id, _grupo_valido(grupo))
-    if not n:
-        raise ErrorUsuario(f"No tienes ejercicios en «{grupo}».")
-    return (f"🗑️ Borrados {n} ejercicios de {grupo}."
-            + (" Vuelve la rutina por defecto." if grupo in gym.GRUPOS else ""))
-
-
-def parse_linea_gym(linea: str, primera: bool = False) -> dict:
-    """Ejercicio de `gym.py` («Press banca — 4x6-8 (RPE 8)») como fila de rutina."""
-    nombre, _, resto = linea.partition(" — ")
-    m = _SPEC.search(resto) if "+" not in resto else None
-    if m and not re.match(r"[\d\"s']", resto[m.end():m.end() + 1] or " "):
-        series, rmin, rmax = int(m.group(1)), int(m.group(2)), int(m.group(3) or m.group(2))
-        nota = (resto[:m.start()] + resto[m.end():]).strip(" ,") or None
-        if nota and nota.startswith("(") and nota.endswith(")") and nota.count("(") == 1:
-            nota = nota[1:-1]
-    else:
-        n = re.search(r"\d+", resto)
-        series, rmin, rmax, nota = (int(n.group()) if n else 3), 0, 0, resto.strip() or None
-    return {"ejercicio": nombre.strip(), "series": series, "reps_min": rmin, "reps_max": rmax,
-            "peso_kg": None, "descanso_s": 150 if primera else 90, "nota": nota,
-            "garmin_cat": garmin_ejercicios.categoria(nombre), "fallos": 0, "id": None}
-
-
-def filas_por_defecto(grupo: str, var: str) -> list[dict]:
-    b = gym.bloque(grupo, var)
-    return [parse_linea_gym(e, i == 0) for i, e in enumerate(b["ejercicios"])] if b else []
-
-
-def importar_rutina(chat_id: int, grupo: str | None = None) -> str:
-    grupos = [_grupo_valido(grupo)] if grupo else list(gym.GRUPOS)
-    hechos, saltados = [], []
-    for g in grupos:
-        if g not in gym.GRUPOS:
-            raise ErrorUsuario(f"No hay rutina por defecto de «{g}». Grupos: {', '.join(gym.GRUPOS)}.")
-        if db.rutina(chat_id, g):
-            saltados.append(g)
-            continue
-        for var in ("A", "B"):
-            for i, f in enumerate(filas_por_defecto(g, var), 1):
-                campos = {k: v for k, v in f.items() if k not in ("id", "fallos")}
-                db.anadir_ejercicio(chat_id, grupo=g, variante=var, orden=i, **campos)
-        hechos.append(g)
-    out = []
-    if hechos:
-        out.append(f"📥 Copiada la rutina de: {', '.join(hechos)}. Pon tus pesos con "
-                   "`/rutina_edit <nº> 80kg` o registra una sesión con /series y los fijo yo.")
-    if saltados:
-        out.append(f"Ya tenías rutina de {', '.join(saltados)}: no la toco "
-                   "(`/rutina_borrar grupo` para empezar de cero).")
-    return "\n".join(out) + "\n\n" + rutina_texto(chat_id, grupo)
-
-
-# ---------- series hechas y progresión ----------
-
-def _aplicar_progresion(chat_id: int, fila, series: list[dict], aplicar: bool = True,
-                        manual: bool = False) -> str:
-    """Progresión del ejercicio. Las series apuntadas a mano siempre la aplican; las del reloj,
-    solo con GARMIN_AJUSTES."""
-    cambios_fila, msg = entrenador.progresion(dict(fila), series)
-    if aplicar and (manual or GARMIN_AJUSTES) and cambios_fila:
-        db.editar_ejercicio(chat_id, fila["id"], **cambios_fila)
-    elif aplicar and cambios_fila and "peso_kg" in cambios_fila:
-        msg += " (ajustes automáticos desactivados: cámbialo tú con `/rutina_edit`)"
-    return msg
-
-
-def registrar_series(chat_id: int, texto: str) -> str:
-    """`id 80x8 80x8 77.5x7` o `id 8 8 7` (con el peso objetivo)."""
-    tok = _tokens(texto)
-    if len(tok) < 2:
-        raise ErrorUsuario("Usa `/series 12 80x8 80x8 80x7` (peso x reps) o `/series 12 8 8 7` "
-                           "si usaste el peso objetivo.")
-    f = _fila(chat_id, tok[0])
-    series = []
-    for i, t in enumerate(tok[1:], 1):
-        t = t.lower().replace(",", ".").replace("×", "x")
-        if m := re.fullmatch(r"(\d+(?:\.\d+)?)(?:kg)?x(\d+)", t):
-            peso, reps = float(m.group(1)), int(m.group(2))
-        elif t.isdigit():
-            peso, reps = f["peso_kg"], int(t)
-        else:
-            raise ErrorUsuario(f"No entiendo la serie «{t}»: usa `80x8` o `8`.")
-        series.append({"rutina_id": f["id"], "ejercicio": f["ejercicio"], "serie": i,
-                       "reps": reps, "peso_kg": peso})
-    db.alta_usuario(chat_id, "atleta")
-    db.guardar_series(chat_id, hoy(), series, "manual")
-    msg = _aplicar_progresion(chat_id, f, series, manual=True)
-    return (f"📝 {menu._md(f['ejercicio'])}: {entrenador.texto_series(series)}"
-            + (f"\n{msg}" if msg else ""))
 
 
 # ---------- Garmin ----------
@@ -881,85 +617,70 @@ async def _g(fn, *args):
         raise
 
 
-def _filas_gym(est: plan.Estructura, entreno: dict) -> list[dict]:
-    propia = est.rutinas.get(entreno["grupo"], {}).get(entreno["variante"])
-    return propia["filas"] if propia else filas_por_defecto(entreno["grupo"], entreno["variante"])
+def _analizar_bici(a: dict, c: dict | None, u: int | None) -> list[str]:
+    if not c or not c.get("pasos") or not u or not a.get("fc_media"):
+        return []
+    zonas = consejo.zonas_bici(u)
+    if c["clave"] in ("recuperacion", "fondo"):
+        zona = "b1" if c["clave"] == "recuperacion" else "b2"
+        alto = zonas[zona][1]
+        if a["fc_media"] > alto + 5:
+            return [f"🐇 FC media {round(a['fc_media'])}, por encima de "
+                    f"{consejo.ZONAS_BICI[zona][2]} (hasta {alto} ppm): hoy tocaba suave."]
+        return [f"✅ Pulso en zona ({consejo.ZONAS_BICI[zona][2]}, hasta {alto} ppm)."]
+    return [f"✅ Hecha la sesión aconsejada: {menu._md(c['titulo'])}."]
 
 
-async def _procesar_fuerza(chat_id: int, d: date, a: dict, s: dict, est: plan.Estructura,
-                           aplicar: bool) -> list[str]:
-    filas = [f for e in s["entrenos"] if e["tipo"] == "gym" for f in _filas_gym(est, e)
-             if f.get("id")]
-    series = a.get("series") or []
-    if not series:
-        return ["El reloj no ha registrado series. Anótalas con `/series <nº> 80x8 80x8…`."]
-    if not filas:
-        por_cat: dict[str, list] = {}
-        for x in series:
-            por_cat.setdefault(x.get("categoria") or "?", []).append(x)
-        return ([f"• {c.lower().replace('_', ' ')}: {entrenador.texto_series(v)}"
-                 for c, v in por_cat.items()]
-                + ["", "Sin rutina propia no puedo seguir tus pesos: `/rutina_importar`."])
-    asignadas, sueltas = entrenador.emparejar(series, filas)
-    out = []
-    for f in filas:
-        ss = asignadas.get(f["id"])
-        if not ss:
-            out.append(f"• {menu._md(f['ejercicio'])}: sin registrar "
-                       f"(`/series {f['id']} 80x8 …` si lo hiciste)")
-            continue
-        db.guardar_series(chat_id, d, [{"rutina_id": f["id"], "ejercicio": f["ejercicio"],
-                                        "serie": i, "reps": x["reps"], "peso_kg": x["peso_kg"]}
-                                       for i, x in enumerate(ss, 1)], "garmin")
-        msg = _aplicar_progresion(chat_id, db.ejercicio(chat_id, f["id"]), ss, aplicar)
-        out.append(f"• {menu._md(f['ejercicio'])}: {entrenador.texto_series(ss)}"
-                   + (f"\n  {msg}" if msg else ""))
-    if sueltas:
-        out.append(f"• Otras series: {entrenador.texto_series(sueltas)}")
-    return out
-
-
-async def procesar_actividad(chat_id: int, a: dict, aplicar: bool = True) -> str:
-    """Compara una actividad del reloj con el plan, ajusta (tests, pesos) y la marca como hecha.
+async def procesar_actividad(chat_id: int, a: dict) -> str:
+    """Analiza una actividad del reloj (frente al consejo del día si lo hubo) y la guarda.
     Devuelve el análisis en Markdown."""
     d = date.fromisoformat(a["fecha"])
-    est = estructura(chat_id)
-    ref, _ = ritmo(chat_id)
-    s = plan.sesiones_dia(d, cambio(chat_id, d), ref, est)
-    previstos = {e["tipo"] for e in s.get("entrenos", [])}
     out = [entrenador.resumen_actividad(a)]
     if a["tipo"] == "carrera":
-        sesion_c = next((e for e in s.get("entrenos", []) if e["tipo"] == "carrera"), None)
-        out += entrenador.analizar_carrera(a, sesion_c, ref)
-        if aplicar and sesion_c and sesion_c["nombre"].startswith("Test"):
-            km = int(re.search(r"\d+", sesion_c["nombre"]).group())
-            seg = entrenador.detectar_test(a, km)
-            if seg and 150 <= seg / km <= 600:
-                db.guardar_test(chat_id, d, km, seg)
-                nuevo, _ = ritmo(chat_id)
-                out.append(f"⏱️ *Test detectado*: {km} km en {plan.tiempo_txt(seg)}. "
-                           f"Ritmo de media nuevo: {plan.pace(nuevo)} /km (antes {plan.pace(ref)}). "
-                           "Mira /ritmos.")
-            else:
-                out.append(f"⏱️ Hoy era el test de {km} km pero no encuentro el tramo: "
-                           f"regístralo con `/test {km}k mm:ss`.")
+        ref, _ = ritmo(chat_id)
+        c = db.consejo(chat_id, d, "carrera")
+        sesion = c if c and c.get("pasos") else None
+        if sesion:
+            out.append(f"🎯 Tocaba: {menu._md(sesion['titulo'])}")
+        out += entrenador.analizar_carrera(a, sesion, ref)
+    elif a["tipo"] == "bici":
+        c = db.consejo(chat_id, d, "bici")
+        if c and c.get("pasos"):
+            out.append(f"🎯 Tocaba: {menu._md(c['titulo'])}")
+        out += _analizar_bici(a, c, umbral(chat_id)[0])
     elif a["tipo"] == "gym":
-        out += await _procesar_fuerza(chat_id, d, a, s, est, aplicar)
-    if a["tipo"] not in previstos:
-        out.append("➕ No estaba en el plan de ese día: cuenta como extra.")
-    elif aplicar and not s["fuera_de_plan"] and not db.entreno(chat_id, d):
-        db.alta_usuario(chat_id, "atleta")
-        await guardar_entreno(chat_id, d, s["titulo"],
-                              f"Garmin: {menu._md(a.get('nombre') or a['tipo'])}")
-        out.append(f"✅ Marcado como hecho: {s['titulo']}")
+        series = a.get("series") or []
+        if series:
+            gyms = [x for x in db.actividades(chat_id, d - timedelta(days=120), 300)
+                    if x["tipo"] == "gym" and x["id"] != a["id"] and x["fecha"] <= a["fecha"]]
+            previas = _previas(gyms + [a]).get(a["id"], {})
+            out += entrenador.resumen_fuerza(series, previas)
+        else:
+            out.append("El reloj no ha registrado series: empieza la *Fuerza* desde tu "
+                       "entreno de Garmin Connect para que se guarden ejercicios y pesos.")
     texto = "\n".join(out)
+    db.alta_usuario(chat_id, "atleta")
     db.guardar_actividad(chat_id, a, texto)
+    await _notion_dia(chat_id, d)
     return texto
+
+
+async def _notion_dia(chat_id: int, d: date) -> bool:
+    """Copia en Notion las actividades del día (una fila por día)."""
+    acts = [x for x in db.actividades(chat_id, d, 50) if x["fecha"] == d.isoformat()]
+    if not acts:
+        return False
+    titulo = " + ".join(x.get("nombre") or x["tipo"] for x in reversed(acts))
+    tipos = list(dict.fromkeys(plan.TIPOS.get(x["tipo"], "Otro") for x in acts))
+    db.marcar_hecho(chat_id, d, titulo, "Garmin")
+    return await notion_sync.sync.guardar_entreno(
+        fecha=d, titulo=titulo, nota="Garmin", semana=d.isocalendar().week, fase=None,
+        dia=nombre(d), tipos=tipos, descarga=False)
 
 
 async def sync_garmin(chat_id: int) -> list[str]:
     """Baja las actividades nuevas del reloj. La primera vez importa 14 días sin avisar
-    (solo analiza las de hoy). Devuelve un análisis por actividad nueva."""
+    (solo avisa de las de hoy). Devuelve un análisis por actividad nueva."""
     _exigir_garmin(chat_id)
     h = hoy()
     primera = not db.hay_actividades(chat_id)
@@ -975,95 +696,31 @@ async def sync_garmin(chat_id: int) -> list[str]:
                 a["series"] = await _g(garmin.series_fuerza, a["id"])
         except Exception as e:  # noqa: BLE001
             log.warning("Garmin: sin detalle de la actividad %s: %s", a["id"], e)
-        silenciosa = primera and a["fecha"] < h.isoformat()
-        texto = await procesar_actividad(chat_id, a, aplicar=not silenciosa)
-        if not silenciosa:
+        texto = await procesar_actividad(chat_id, a)
+        if not (primera and a["fecha"] < h.isoformat()):
             msgs.append(texto)
+    if db.programados(chat_id):
+        try:
+            await limpiar_reloj(chat_id)
+        except Exception as e:  # noqa: BLE001
+            log.info("Garmin: no se pudo limpiar el calendario: %s", e)
     return msgs
 
 
 async def revisar_bienestar(chat_id: int, forzar: bool = False) -> str:
-    """Lee el estado de forma de hoy y, una vez al día, adapta la sesión si hace falta.
-    Devuelve texto solo si hay algo que contar (o si `forzar`)."""
+    """Lee el estado de forma de hoy. Devuelve texto la primera vez que hay datos en el día
+    (o siempre si `forzar`). El consejo de /carrera y /bici ya lo tiene en cuenta."""
     _exigir_garmin(chat_id)
     h = hoy()
     db.alta_usuario(chat_id, "atleta")
     db.guardar_bienestar(chat_id, h, await _g(garmin.bienestar, h))
     b = dict(db.bienestar(chat_id, h))
     hay_datos = b["readiness"] is not None or b["hrv_estado"] is not None
-    if b["aplicado"] or not hay_datos:
-        return entrenador.texto_bienestar(b) if forzar else ""
-    db.marcar_bienestar_aplicado(chat_id, h)
-    out = [entrenador.texto_bienestar(b)]
-    if plan.datos_semana(plan.semana_indice(h)) is None:
-        return "\n".join(out)
-    cs = cambios_semana(chat_id, h)
-    est = estructura(chat_id)
-    modo, motivo = entrenador.regla_bienestar(b, plan.carga_dia(h, cs, est))
-    if modo and GARMIN_AJUSTES and ahora().hour < 13 and h not in cs and not db.entreno(chat_id, h):
-        guardar(chat_id, plan.cambiar(cs, h, modo))
-        out += ["", f"🔁 {motivo}", "", formatear_dia(chat_id, h), "",
-                "_Si te ves bien, `/deshacer` vuelve a la sesión original._"]
-    elif motivo:
-        out += ["", f"💡 {motivo}"]
-    return "\n".join(out)
-
-
-async def enviar_reloj(chat_id: int, dias: int = GARMIN_DIAS_ENVIO) -> list[str]:
-    """Deja en el calendario de Garmin las sesiones de los próximos `dias` días (con los
-    cambios). Solo sube lo que ha cambiado; borra lo que ya no toca."""
-    _exigir_garmin(chat_id)
-    h = hoy()
-    est = estructura(chat_id)
-    ref, _ = ritmo(chat_id)
-    deseados: dict[tuple[str, str], dict] = {}
-    for i in range(dias):
-        d = h + timedelta(days=i)
-        if d == h and db.entreno(chat_id, d):
-            continue
-        s = plan.sesiones_dia(d, cambio(chat_id, d), ref, est)
-        for e in s.get("entrenos", []):
-            clave = e["tipo"] + (f":{e['grupo']}" if e["tipo"] == "gym" else "")
-            if e["tipo"] == "carrera":
-                n = f"{garmin.PREFIJO} {d:%d/%m} {e['nombre']}"
-                j = garmin.json_carrera(n, e, ref)
-            elif e["tipo"] == "gym":
-                n = f"{garmin.PREFIJO} {d:%d/%m} {gym.titulo(e['grupo'])} {e['variante']}"
-                j = garmin.json_fuerza(n, _filas_gym(est, e), e)
-            else:
-                n = f"{garmin.PREFIJO} {d:%d/%m} {plan.TIPOS[e['tipo']]} {e['minutos']}'"
-                j = garmin.json_cardio(n, e)
-            deseados[(d.isoformat(), clave)] = j
-    hecho_hoy = db.entreno(chat_id, h) is not None
-    existentes = {(r["fecha"], r["clave"]): r
-                  for r in db.programados(chat_id, h, h + timedelta(days=dias - 1))}
-    out = []
-    for k, r in existentes.items():
-        if k[0] == h.isoformat() and hecho_hoy:
-            continue
-        if k not in deseados or r["hash"] != garmin.huella(deseados[k]):
-            try:
-                await _g(garmin.borrar, r["workout_id"])
-            except Exception as e:  # noqa: BLE001
-                log.info("Garmin: no se pudo borrar %s: %s", r["workout_id"], e)
-            db.borrar_programado(chat_id, *k)
-            if k not in deseados:
-                out.append(f"🗑️ {date.fromisoformat(k[0]):%d/%m} {k[1]}: quitado")
-    for k, j in deseados.items():
-        r = existentes.get(k)
-        if r and r["hash"] == garmin.huella(j):
-            continue
-        wid = await _g(garmin.subir, j)
-        await _g(garmin.programar, wid, date.fromisoformat(k[0]))
-        db.guardar_programado(chat_id, date.fromisoformat(k[0]), k[1], wid, garmin.huella(j))
-        out.append(f"⌚ {j['workoutName'].removeprefix(garmin.PREFIJO).strip()}")
-    for r in db.programados(chat_id, hasta=h - timedelta(days=15)):
-        try:
-            await _g(garmin.borrar, r["workout_id"])
-        except Exception:  # noqa: BLE001
-            pass
-        db.borrar_programado(chat_id, r["fecha"], r["clave"])
-    return out
+    if not forzar and (b["aplicado"] or not hay_datos):
+        return ""
+    if hay_datos:
+        db.marcar_bienestar_aplicado(chat_id, h)
+    return entrenador.texto_bienestar(b)
 
 
 def actividades_texto(chat_id: int, n: int = 5) -> str:

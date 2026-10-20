@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import gym
-from config import DESENTRENO_SEC, MARCA_MEDIA_SEC, PLAN_START
+from config import DESENTRENO_SEC, GYM_EJERCICIOS_SESION, MARCA_MEDIA_SEC, PLAN_START
 
 DIAS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
@@ -77,10 +77,13 @@ Item = tuple[str, str | None]  # (tipo, grupo de gimnasio o None)
 
 @dataclass(frozen=True)
 class Estructura:
-    """Qué lleva cada día de la semana (0 = lunes) y las rutinas propias de gimnasio
-    (`{grupo: {variante: {"titulo", "ejercicios", "filas"}}}`, ver `gym.formatear`)."""
+    """Qué lleva cada día de la semana (0 = lunes), las rutinas propias de gimnasio
+    (`{grupo: {variante: {"titulo", "ejercicios", "filas"}}}`, ver `gym.formatear`) y el
+    reparto de gimnasio reorganizado por fecha (`{fecha: (grupos…)}`; tupla vacía = ese día
+    ya no hay gimnasio). El reparto va por fecha en la que se entrena, no por día de origen."""
     dias: tuple[tuple[Item, ...], ...]
     rutinas: dict = field(default_factory=dict, compare=False, hash=False)
+    reparto: dict = field(default_factory=dict, compare=False, hash=False)
 
     def items(self, dow: int) -> tuple[Item, ...]:
         return self.dias[dow] or (("descanso", None),)
@@ -101,6 +104,40 @@ class Estructura:
 
     def pierna(self, dow: int) -> bool:
         return any(gym.zona(g) != "superior" for g in self.grupos(dow))
+
+    # Versiones por fecha: la sesión del día `origen` hecha en `dia`, con el reparto aplicado
+
+    def reorganizado(self, dia: date, origen: date | None = None) -> bool:
+        origen = origen or dia
+        return dia in self.reparto and any(t == "gym" for t, _ in self.items(origen.weekday()))
+
+    def items_en(self, dia: date, origen: date | None = None) -> tuple[Item, ...]:
+        origen = origen or dia
+        items = self.items(origen.weekday())
+        if not self.reorganizado(dia, origen):
+            return items
+        pos = next(k for k, i in enumerate(items) if i[0] == "gym")
+        otros = [i for i in items if i[0] != "gym"]
+        antes = sum(1 for i in items[:pos] if i[0] != "gym")
+        nuevos = otros[:antes] + [("gym", g) for g in self.reparto[dia]] + otros[antes:]
+        return tuple(nuevos) or (("descanso", None),)
+
+    def tipos_en(self, dia: date, origen: date | None = None) -> set[str]:
+        tipos = {t for t, _ in self.items_en(dia, origen)}
+        return tipos - {"descanso"} or {"descanso"}
+
+    def grupos_en(self, dia: date, origen: date | None = None) -> list[str]:
+        return [g for t, g in self.items_en(dia, origen) if t == "gym" and g]
+
+    def pierna_en(self, dia: date, origen: date | None = None) -> bool:
+        return any(gym.zona(g) != "superior" for g in self.grupos_en(dia, origen))
+
+    def max_ejercicios(self, dia: date, origen: date | None = None) -> int | None:
+        """Ejercicios por grupo en una sesión reorganizada que junta varios grupos."""
+        n = len(self.grupos_en(dia, origen))
+        if not self.reorganizado(dia, origen) or n < 2:
+            return None
+        return max(2, GYM_EJERCICIOS_SESION // n)
 
 
 ESTRUCTURA_DEFECTO = Estructura((
@@ -440,9 +477,12 @@ def minutos_texto(texto: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def _entreno_gym(grupo: str, var: str, descarga: bool) -> dict:
-    return {"tipo": "gym", "grupo": grupo, "variante": var, "series_menos": 1 if descarga else 0,
-            "carga": 1.0}
+def _entreno_gym(grupo: str, var: str, descarga: bool, maximo: int | None = None) -> dict:
+    e = {"tipo": "gym", "grupo": grupo, "variante": var, "series_menos": 1 if descarga else 0,
+         "carga": 1.0}
+    if maximo:
+        e["max_ejercicios"] = maximo
+    return e
 
 
 def sesiones_dia(dia: date, cambio: Cambio | None = None, ref: int | None = None,
@@ -451,13 +491,13 @@ def sesiones_dia(dia: date, cambio: Cambio | None = None, ref: int | None = None
     est = _est(est)
     if cambio is None or (cambio.origen == dia and cambio.modo is None):
         return _sesion_base(dia, ref, est)
-    s = dict(_sesion_base(cambio.origen, ref, est))
+    s = dict(_sesion_base(cambio.origen, ref, est, dia))
     s["fecha"], s["origen"], s["modo"] = dia, cambio.origen, cambio.modo
     if s["fuera_de_plan"]:
         return s
     if cambio.origen != dia:
         s["titulo"] += f" (movida del {DIAS[cambio.origen.weekday()].lower()})"
-    tipos = est.tipos(cambio.origen.weekday())
+    tipos = est.tipos_en(dia, cambio.origen)
     entrenos = [dict(e) for e in s["entrenos"]]
     if cambio.modo == "descanso":
         s["titulo"] = f"Descanso (saltas: {s['titulo']})"
@@ -517,9 +557,12 @@ def sesiones_dia(dia: date, cambio: Cambio | None = None, ref: int | None = None
     return s
 
 
-def _sesion_base(dia: date, ref: int | None = None, est: Estructura | None = None) -> dict:
-    """Sesión del plan para un día, sin cambios del usuario."""
+def _sesion_base(dia: date, ref: int | None = None, est: Estructura | None = None,
+                 ejecucion: date | None = None) -> dict:
+    """Sesión del plan para un día, sin cambios del usuario. `ejecucion` es la fecha en la que
+    se hace (si se ha movido) y decide el reparto de gimnasio que se aplica."""
     est = _est(est)
+    ejecucion = ejecucion or dia
     wn = semana_indice(dia)
     w = datos_semana(wn, ref, est)
     dow = dia.weekday()
@@ -536,15 +579,32 @@ def _sesion_base(dia: date, ref: int | None = None, est: Estructura | None = Non
         }
 
     var = variante(wn)
-    tipos = est.tipos(dow)
+    tipos = est.tipos_en(ejecucion, dia)
+    grupos = est.grupos_en(ejecucion, dia)
+    pierna = est.pierna_en(ejecucion, dia)
+    reorganizado = est.reorganizado(ejecucion, dia)
+    maximo = est.max_ejercicios(ejecucion, dia)
     dc = est.dia_carrera()
     titulos, bloques, entrenos = [], [], []
     c = carrera_de(dia, ref, est)
-    for tipo, grupo in est.items(dow):
+    if reorganizado:
+        if grupos:
+            bloques.append(("🔄 Reorganizado", "Gimnasio reorganizado según lo que llevas hecho "
+                            "esta semana" + (f": los {maximo} ejercicios principales de cada grupo."
+                                             if maximo else ".")))
+        else:
+            bloques.append(("🔄 Sin gimnasio", "Ya has hecho (o repartido en otros días) todo el "
+                                              "gimnasio de esta semana."))
+    for tipo, grupo in est.items_en(ejecucion, dia):
         if tipo == "gym" and grupo:
-            titulos.append(f"Gimnasio · {gym.titulo(grupo)}")
-            bloques.append(("🏋️ Gimnasio", gym.formatear(grupo, var, est.rutinas.get(grupo))))
-            entrenos.append(_entreno_gym(grupo, var, w["descarga"]))
+            if reorganizado:
+                if grupo == grupos[0]:
+                    titulos.append("Gimnasio · " + " + ".join(gym.titulo(g) for g in grupos))
+            else:
+                titulos.append(f"Gimnasio · {gym.titulo(grupo)}")
+            bloques.append(("🏋️ Gimnasio", gym.formatear(grupo, var, est.rutinas.get(grupo),
+                                                          maximo)))
+            entrenos.append(_entreno_gym(grupo, var, w["descarga"], maximo))
             if gym.zona(grupo) == "pierna" and "carrera" not in tipos:
                 extra = "10' de movilidad de cadera y tobillo al terminar."
                 if dc is not None and dc - dow >= 2:
@@ -579,9 +639,9 @@ def _sesion_base(dia: date, ref: int | None = None, est: Estructura | None = Non
         bloques.append(("😴 Descanso", "Día libre. Si esta semana has saltado algo, este es el "
                                       "hueco para recuperarlo (`/mover`). Si no, descansa, "
                                       "pasea o haz 10' de movilidad."))
-    if c and est.grupos(dow):
-        nombres = " y ".join(gym.titulo(g) for g in est.grupos(dow))
-        if est.pierna(dow):
+    if c and grupos:
+        nombres = " y ".join(gym.titulo(g) for g in grupos)
+        if pierna:
             orden = (f"Corre primero. {nombres} después (o por la tarde). Ojo: pierna y "
                      "carrera el mismo día cargan mucho; baja el volumen si vas justo.")
         else:
@@ -699,6 +759,7 @@ def tipos_dia(dia: date, cambio: Cambio | None = None,
               est: Estructura | None = None) -> list[str]:
     """Categorías de entrenamiento de un día, para etiquetar en Notion."""
     est = _est(est)
+    ejecucion = dia
     if cambio:
         especiales = {"descanso": ["Descanso"], "bici": ["Bici"], "natacion": ["Natación"]}
         if cambio.modo in especiales and datos_semana(semana_indice(dia)):
@@ -707,8 +768,8 @@ def tipos_dia(dia: date, cambio: Cambio | None = None,
     if datos_semana(semana_indice(dia)) is None:
         return []
     out = []
-    for t, _ in est.items(dia.weekday()):
-        if TIPOS[t] not in out and (t != "descanso" or est.descanso(dia.weekday())):
+    for t, _ in est.items_en(ejecucion, dia):
+        if TIPOS[t] not in out and (t != "descanso" or est.tipos_en(ejecucion, dia) == {"descanso"}):
             out.append(TIPOS[t])
     return out
 
@@ -802,12 +863,12 @@ def carga_dia(dia: date, cambios: dict[date, Cambio], est: Estructura | None = N
     c = efectivo(cambios, dia)
     if c.modo in ("descanso", "bici", "natacion"):
         return "ligera"
-    dow = c.origen.weekday()
-    if "carrera" in est.tipos(dow):
+    tipos = est.tipos_en(dia, c.origen)
+    if "carrera" in tipos:
         carga = "carrera"
-    elif est.pierna(dow):
+    elif est.pierna_en(dia, c.origen):
         carga = "pierna"
-    elif est.descanso(dow):
+    elif tipos == {"descanso"}:
         carga = "ligera"
     else:
         carga = "otra"
@@ -869,13 +930,12 @@ def recomendar(dia: date, cambios: dict[date, Cambio], energia: int,
     Devuelve (modo, o None si no hace falta tocar nada; explicación)."""
     est = _est(est)
     c = efectivo(cambios, dia)
-    dow = c.origen.weekday()
-    tipos = est.tipos(dow)
+    tipos = est.tipos_en(dia, c.origen)
     if c.modo == "descanso" or (tipos == {"descanso"} and c.modo is None):
         return None, "Hoy ya es de descanso: aprovecha para recuperar."
-    grupos = est.grupos(dow)
+    grupos = est.grupos_en(dia, c.origen)
     superior = [g for g in grupos if gym.zona(g) != "pierna"]
-    impacto = "carrera" in tipos or est.pierna(dow)
+    impacto = "carrera" in tipos or est.pierna_en(dia, c.origen)
     tren_superior = "carrera" not in tipos and ("natacion" in tipos or bool(superior))
     if zona == "general" or energia <= 1:
         return "descanso", "Con malestar general o sin energía, lo que más suma es descansar."

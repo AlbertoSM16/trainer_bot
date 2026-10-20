@@ -146,6 +146,10 @@ def bienestar(fecha) -> dict:
             if nums:
                 valores.append(nums[0])
         out["body_battery"] = max(valores) if valores else None
+    lt = _probar(lambda: g.get_lactate_threshold(latest=True)) or {}
+    fc_umbral = (lt.get("speed_and_heart_rate") or {}).get("heartRate")
+    if fc_umbral:
+        out["fc_umbral"] = int(fc_umbral)
     pred = _probar(g.get_race_predictions)
     if isinstance(pred, list):
         pred = pred[-1] if pred else None
@@ -232,6 +236,30 @@ def objetivo_ritmo(ref: int, zona: str) -> dict:
         rapido, lento = rapido - 5, lento + 5
     return {"targetType": RITMO, "targetValueOne": round(1000 / lento, 3),
             "targetValueTwo": round(1000 / rapido, 3)}
+
+
+PULSO = {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"}
+
+
+def _pasos_bici(o: _Orden, pasos: list, zonas: dict | None, grupo: int | None = None) -> list[dict]:
+    """Pasos de bici con objetivo de pulso (ppm) si hay zonas; si no, sin objetivo."""
+    out = []
+    for p in pasos:
+        if p[0] == "repetir":
+            out.append(_repetir(o, p[1], lambda g, hijos=p[2]: _pasos_bici(o, hijos, zonas, g)))
+            continue
+        tipo, (cond, valor), zona = p
+        extra = {}
+        if zonas and zona in zonas:
+            a, b = zonas[zona]
+            extra = {"targetType": PULSO, "targetValueOne": a, "targetValueTwo": b}
+        out.append(_paso(o, tipo, cond, valor, grupo, **extra))
+    return out
+
+
+def json_bici(nombre: str, entreno: dict, zonas: dict | None) -> dict:
+    return _entreno(nombre, "bici", _pasos_bici(_Orden(), entreno["pasos"], zonas),
+                    entreno.get("texto", ""))
 
 
 def _pasos_carrera(o: _Orden, pasos: list, ref: int, grupo: int | None = None) -> list[dict]:

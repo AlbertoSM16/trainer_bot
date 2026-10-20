@@ -143,15 +143,18 @@ def bloque(grupo: str, variante: str) -> dict | None:
     return g[variante] if g else None
 
 
-def formatear(grupo: str, variante: str, propia: dict | None = None) -> str:
+def formatear(grupo: str, variante: str, propia: dict | None = None,
+              max_ejercicios: int | None = None) -> str:
     """Rutina del grupo. `propia` ({variante: {"titulo", "ejercicios"}}) es la rutina del
-    usuario y tiene prioridad sobre la de este módulo."""
+    usuario y tiene prioridad sobre la de este módulo. `max_ejercicios` deja solo los
+    primeros (los principales) en las sesiones que juntan varios grupos."""
     b = (propia or {}).get(variante) or bloque(grupo, variante)
     if b is None:
         return (f"Aún no tienes rutina para «{grupo}». Añádela con "
                 f"`/rutina_add {grupo} \"Ejercicio\" 4x8 60kg`.")
+    ejercicios = b["ejercicios"][:max_ejercicios] if max_ejercicios else b["ejercicios"]
     lineas = [f"🏋️ *{b['titulo']}*", ""]
-    lineas += [f"• {e}" for e in b["ejercicios"]]
+    lineas += [f"• {e}" for e in ejercicios]
     lineas.append("")
     lineas.append("_Calienta 8' + series de aproximación. Accesorios a RIR 1-2 (te quedan 1-2 reps). "
                   "Progresa peso o reps cada semana._")
