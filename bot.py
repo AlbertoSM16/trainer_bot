@@ -12,13 +12,14 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 import alimentos
 import coach
 import db
+import garmin
 import gym
 import menu
 import notion_sync
 import plan
 import servicios as sv
-from config import (COMPRA_HOUR, COMPRA_MINUTE, REMINDER_HOUR, REMINDER_MINUTE,
-                    TELEGRAM_TOKEN)
+from config import (COMPRA_HOUR, COMPRA_MINUTE, GARMIN_CHAT_ID, GARMIN_ENVIAR, GARMIN_SYNC_MIN,
+                    REMINDER_HOUR, REMINDER_MINUTE, TELEGRAM_TOKEN)
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                     level=logging.INFO)
@@ -37,7 +38,7 @@ AYUDA = """🤖 *Tu entrenador personal*
 /hoy — sesión de hoy
 /manana — sesión de mañana
 /semana `[nº]` — resumen semanal (por defecto, la actual)
-/gym — detalle del gimnasio de hoy
+/gym — rutina de gimnasio de hoy (con tus pesos)
 /ritmos — ritmos y zonas (salen de tu último test)
 /bloque — bloque de 8 semanas y próximo test
 /test `10k 44:30` — registra un test y recalcula ritmos
@@ -48,6 +49,26 @@ AYUDA = """🤖 *Tu entrenador personal*
 /saltar `[día]` — hoy (o ese día) descansas
 /cambiar `corta|suave|bici|natacion [día]` — versión corta, suave o alternativa sin impacto
 /deshacer `[día|semana]` — quita los cambios
+
+*Tu semana tipo*
+/semana\\_config — qué lleva cada día
+/dia\\_config `sabado carrera+gym:hombro` — cambia un día (carrera, natacion, bici, descanso, gym:grupo)
+/semana\\_reset — vuelve a la semana por defecto
+
+*Tu rutina de gimnasio*
+/rutina `[grupo]` — tus ejercicios, series y pesos
+/rutina\\_add `pecho "Press banca" 4x6-8 80kg` — añade un ejercicio (`A`/`B`, `90s`, `pc`)
+/rutina\\_edit `12 85kg` — cambia peso, series, nombre, nota…
+/rutina\\_del `12` — quita un ejercicio
+/rutina\\_borrar `grupo` — borra un grupo entero
+/rutina\\_importar `[grupo]` — copia la rutina por defecto para editarla
+/series `12 80x8 80x8 80x7` — apunta lo que hiciste y ajusto el peso
+
+*Garmin*
+/garmin — estado y sincroniza ahora
+/actividades `[n]` — tus últimas actividades analizadas
+/bienestar — readiness, HRV, sueño y body battery
+/enviar\\_reloj — manda los entrenos de los próximos días al reloj
 
 *Seguimiento*
 /hecho `[nota]` — marca el entreno de hoy como completado
@@ -110,6 +131,12 @@ def _arg(ctx: ContextTypes.DEFAULT_TYPE, i: int) -> str | None:
     return ctx.args[i] if len(ctx.args) > i else None
 
 
+def _resto(update: Update) -> str:
+    """Texto del mensaje tras el comando (respeta comillas y espacios)."""
+    partes = (update.effective_message.text or "").split(maxsplit=1)
+    return partes[1].strip() if len(partes) > 1 else ""
+
+
 # ---------- entrenamiento ----------
 
 @comando
@@ -117,13 +144,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     texto = (
         f"¡Hola {u.first_name}! 💪\n\n"
-        "Soy tu entrenador. Tu semana tipo:\n"
-        "• L pecho+tríceps · M espalda+bíceps · X pierna\n"
-        "• J natación · V descanso flexible\n"
-        "• S carrera + hombro y core · D bici\n\n"
-        "El plan va en bloques de 8 semanas con un test de 5 o 10 km al final de cada uno "
-        "para recalcular tus ritmos. La dieta es un volumen muy limpio hasta 81 kg.\n\n"
-        "Te escribiré cada mañana con el entreno y el menú del día.\n\n" + AYUDA
+        "Soy tu entrenador. El plan va en bloques de 8 semanas con un test de 5 o 10 km al "
+        "final de cada uno para recalcular tus ritmos. La dieta es un volumen muy limpio.\n\n"
+        "Configura tu semana con /dia\\_config y tu rutina con /rutina (pesos y repeticiones). "
+        "Si conectas tu Garmin, leo tus actividades, ajusto pesos y ritmos y te mando los "
+        "entrenos al reloj.\n\n"
+        + sv.semana_config_texto(update.effective_chat.id) + "\n\n" + AYUDA
     )
     await _enviar(update, texto)
 
@@ -156,18 +182,17 @@ async def semana(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @comando
 async def gimnasio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     d = sv.hoy()
-    wn = plan.semana_indice(d)
-    if plan.datos_semana(wn) is None:
+    if plan.datos_semana(plan.semana_indice(d)) is None:
         raise sv.ErrorUsuario("Hoy estás fuera del plan.")
-    c = sv.cambio(update.effective_chat.id, d)
-    grupos = {0: "pecho", 1: "espalda", 2: "pierna", 5: "hombro"}
-    grupo = None
-    if c is None or c.modo in (None, "corta", "suave"):
-        grupo = grupos.get((c.origen if c else d).weekday())
-    if not grupo:
+    s = sv.sesion(chat_id, d)
+    gyms = [e for e in s["entrenos"] if e["tipo"] == "gym"]
+    if not gyms:
         raise sv.ErrorUsuario("Hoy no toca gimnasio. Usa /hoy para ver la sesión que te corresponde.")
-    await _enviar(update, gym.formatear(grupo, plan.variante(wn)))
+    rut = sv.rutinas(chat_id)
+    await _enviar(update, "\n\n".join(gym.formatear(e["grupo"], e["variante"], rut.get(e["grupo"]))
+                                       for e in gyms))
 
 
 @comando
@@ -288,7 +313,9 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         out.append("Aún no has registrado peso ni grasa. Usa /peso y /grasa.")
 
-    out += ["", f"*Esta semana*: {len(hechos)}/6 sesiones completadas"]
+    est = sv.estructura(chat_id)
+    previstas = sum(not est.descanso(i) for i in range(7))
+    out += ["", f"*Esta semana*: {len(hechos)}/{previstas} sesiones completadas"]
     for r in hechos:
         nota = f" — _{menu._md(r['nota'])}_" if r["nota"] else ""
         out.append(f"  ✅ {r['fecha']} {r['titulo']}{nota}")
@@ -335,6 +362,129 @@ async def recordatorio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db.set_recordatorio(update.effective_chat.id, activo)
     await _enviar(update, f"🔔 Recordatorio diario {'activado' if activo else 'desactivado'}"
                           + (f" a las {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d}." if activo else "."))
+
+
+# ---------- semana tipo y rutina ----------
+
+@comando
+async def semana_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _enviar(update, sv.semana_config_texto(update.effective_chat.id))
+
+
+@comando
+async def dia_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 2:
+        raise sv.ErrorUsuario("Usa `/dia_config sabado carrera+gym:hombro` o `/dia_config viernes "
+                              "descanso`. Tipos: carrera, natacion, bici, descanso, gym:grupo.")
+    await _enviar(update, sv.configurar_dia(update.effective_chat.id, ctx.args[0],
+                                            " ".join(ctx.args[1:])))
+
+
+@comando
+async def semana_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _enviar(update, sv.reset_semana(update.effective_chat.id))
+
+
+@comando
+async def rutina(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _enviar(update, sv.rutina_texto(update.effective_chat.id, _arg(ctx, 0)))
+
+
+@comando
+async def rutina_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _enviar(update, sv.anadir_ejercicio(update.effective_chat.id, _resto(update)))
+
+
+@comando
+async def rutina_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _enviar(update, sv.editar_ejercicio(update.effective_chat.id, _resto(update)))
+
+
+@comando
+async def rutina_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        raise sv.ErrorUsuario("Usa `/rutina_del 12` (el número lo ves en /rutina).")
+    await _enviar(update, sv.borrar_ejercicio(update.effective_chat.id, ctx.args[0]))
+
+
+@comando
+async def rutina_borrar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        raise sv.ErrorUsuario("Usa `/rutina_borrar pecho` para borrar todos sus ejercicios.")
+    await _enviar(update, sv.borrar_rutina_grupo(update.effective_chat.id, ctx.args[0]))
+
+
+@comando
+async def rutina_importar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _enviar(update, sv.importar_rutina(update.effective_chat.id, _arg(ctx, 0)))
+
+
+@comando
+async def series(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _enviar(update, sv.registrar_series(update.effective_chat.id, _resto(update)))
+
+
+# ---------- Garmin ----------
+
+async def _garmin_seguro(coro, que: str) -> str:
+    try:
+        return await coro
+    except sv.ErrorUsuario:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log.warning("Garmin (%s): %s", que, e)
+        return f"⚠️ No he podido {que}: {menu._md(str(e))[:200]}"
+
+
+@comando
+async def garmin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not garmin.configurado():
+        raise sv.ErrorUsuario(
+            "⌚ *Garmin no está configurado.*\n\n"
+            "1. Ejecuta una vez `.venv/bin/python garmin_login.py` (correo, contraseña y MFA).\n"
+            f"2. Pon `GARMIN_CHAT_ID={chat_id}` en tu `.env`.\n"
+            "3. Reinicia el bot.\n\nTienes los detalles en el README.")
+    await update.effective_message.reply_text("⌚ Sincronizando con Garmin…")
+    await ctx.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    async def _sync():
+        msgs = await sv.sync_garmin(chat_id)
+        return ("\n\n".join(msgs) if msgs else "Sin actividades nuevas.")
+
+    async def _reloj():
+        r = await sv.enviar_reloj(chat_id)
+        return ("*Reloj*\n" + "\n".join(r)) if r else "Reloj al día."
+
+    partes = [await _garmin_seguro(_sync(), "leer tus actividades"),
+              await _garmin_seguro(sv.revisar_bienestar(chat_id, forzar=True),
+                                   "leer tu estado de forma")]
+    if GARMIN_ENVIAR:
+        partes.append(await _garmin_seguro(_reloj(), "enviar los entrenos al reloj"))
+    await _enviar(update, "\n\n".join(p for p in partes if p))
+
+
+@comando
+async def actividades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    n = int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else 5
+    await _enviar(update, sv.actividades_texto(update.effective_chat.id, min(n, 15)))
+
+
+@comando
+async def bienestar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _enviar(update, sv.bienestar_texto(update.effective_chat.id))
+
+
+@comando
+async def enviar_reloj(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.effective_message.reply_text("⌚ Enviando entrenos al reloj…")
+    r = await _garmin_seguro(sv.enviar_reloj(chat_id), "enviar los entrenos al reloj")
+    if isinstance(r, list):
+        r = ("⌚ *Enviado al calendario de Garmin*\n" + "\n".join(r) if r else
+             "⌚ Tu reloj ya tiene los entrenos de los próximos días.")
+        r += "\n\n_Sincroniza el reloj con la app Garmin Connect para que aparezcan._"
+    await _enviar(update, r)
 
 
 # ---------- dieta ----------
@@ -408,6 +558,13 @@ async def _mandar(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, texto: str, **kw
 async def aviso_diario(ctx: ContextTypes.DEFAULT_TYPE):
     d = sv.hoy()
     for chat_id in db.usuarios_con_recordatorio():
+        if sv.garmin_activo(chat_id):
+            try:
+                texto = await sv.revisar_bienestar(chat_id)
+                if texto:
+                    await _mandar(ctx, chat_id, texto)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Garmin: sin estado de forma: %s", e)
         try:
             await _mandar(ctx, chat_id, "☀️ *Entreno de hoy*\n\n" + sv.formatear_dia(chat_id, d))
             await _mandar(ctx, chat_id, sv.menu_texto(chat_id, d))
@@ -426,6 +583,33 @@ async def aviso_compra(ctx: ContextTypes.DEFAULT_TYPE):
             log.warning("No se pudo enviar la compra a %s: %s", chat_id, e)
 
 
+async def sync_garmin(ctx: ContextTypes.DEFAULT_TYPE):
+    """Cada GARMIN_SYNC_MIN minutos: actividades nuevas (análisis + comentario del coach),
+    estado de forma por la mañana y entrenos al reloj (en silencio)."""
+    chat_id = GARMIN_CHAT_ID
+    try:
+        for texto in await sv.sync_garmin(chat_id):
+            await _mandar(ctx, chat_id, texto)
+            comentario = await coach.comentar_actividad(chat_id, texto)
+            if comentario:
+                await _mandar(ctx, chat_id, comentario)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Garmin: fallo al sincronizar actividades: %s", e)
+    ahora = sv.ahora()
+    if 6 <= ahora.hour < 13:
+        try:
+            texto = await sv.revisar_bienestar(chat_id)
+            if texto:
+                await _mandar(ctx, chat_id, texto)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Garmin: fallo al leer el estado de forma: %s", e)
+    if GARMIN_ENVIAR:
+        try:
+            await sv.enviar_reloj(chat_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Garmin: fallo al enviar entrenos al reloj: %s", e)
+
+
 async def post_init(app: Application):
     if notion_sync.activo():
         if await notion_sync.sync.preparar():
@@ -436,6 +620,8 @@ async def post_init(app: Application):
     else:
         log.info("Notion no configurado: se guarda solo en SQLite.")
     log.info("Coach con Claude: %s", "activo" if coach.activo() else "sin ANTHROPIC_API_KEY")
+    log.info("Garmin: %s", f"activo para el chat {GARMIN_CHAT_ID}" if garmin.configurado()
+             else "no configurado")
 
     await app.bot.set_my_commands([
         BotCommand("hoy", "Entreno de hoy"),
@@ -446,6 +632,20 @@ async def post_init(app: Application):
         BotCommand("ritmos", "Ritmos y zonas de entrenamiento"),
         BotCommand("bloque", "Bloque actual y próximo test"),
         BotCommand("test", "Registrar un test (10k 44:30)"),
+        BotCommand("rutina", "Tu rutina de gimnasio con pesos"),
+        BotCommand("rutina_add", "Añadir un ejercicio a tu rutina"),
+        BotCommand("rutina_edit", "Cambiar peso, series o nombre de un ejercicio"),
+        BotCommand("rutina_del", "Quitar un ejercicio"),
+        BotCommand("rutina_borrar", "Borrar un grupo de tu rutina"),
+        BotCommand("rutina_importar", "Copiar la rutina por defecto para editarla"),
+        BotCommand("series", "Apuntar las series hechas de un ejercicio"),
+        BotCommand("semana_config", "Ver tu semana tipo"),
+        BotCommand("dia_config", "Cambiar qué lleva un día de la semana"),
+        BotCommand("semana_reset", "Volver a la semana por defecto"),
+        BotCommand("garmin", "Estado de Garmin y sincronizar ahora"),
+        BotCommand("actividades", "Últimas actividades del reloj"),
+        BotCommand("bienestar", "Readiness, HRV, sueño y body battery"),
+        BotCommand("enviar_reloj", "Mandar los próximos entrenos al reloj"),
         BotCommand("mover", "Intercambiar dos días de esta semana"),
         BotCommand("saltar", "Descansar hoy u otro día"),
         BotCommand("cambiar", "Versión corta, suave, bici o natación"),
@@ -482,6 +682,12 @@ def main():
         "mover": mover, "saltar": saltar, "cambiar": cambiar, "deshacer": deshacer,
         "dieta": dieta, "menu": menu_cmd, "plato": plato, "compra": lista_compra,
         "olvidar": olvidar,
+        "semana_config": semana_config, "dia_config": dia_config, "semana_reset": semana_reset,
+        "rutina": rutina, "rutina_add": rutina_add, "rutina_edit": rutina_edit,
+        "rutina_del": rutina_del, "rutina_borrar": rutina_borrar,
+        "rutina_importar": rutina_importar, "series": series,
+        "garmin": garmin_cmd, "actividades": actividades, "bienestar": bienestar,
+        "enviar_reloj": enviar_reloj,
     }
     for nombre, fn in handlers.items():
         app.add_handler(CommandHandler(nombre, fn))
@@ -501,6 +707,9 @@ def main():
             days=(6,),
             name="aviso_compra",
         )
+        if garmin.configurado():
+            app.job_queue.run_repeating(sync_garmin, interval=GARMIN_SYNC_MIN * 60, first=30,
+                                        name="sync_garmin")
     log.info("Bot en marcha. Plan cíclico desde el %s.", plan.PLAN_START.isoformat())
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

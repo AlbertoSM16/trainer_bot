@@ -1,6 +1,6 @@
 # 🏃‍♂️ Bot de entrenamiento
 
-Bot de Telegram que hace de entrenador y nutricionista. Gestiona un plan **cíclico** de gimnasio (4 días), carrera, natación y bici para mejorar la forma física y rendir al máximo corriendo, **sin competir**. Incluye una dieta de **volumen muy limpio** (de 79 a 81 kg), la lista de la compra de Mercadona y un **coach conversacional con Claude** que adapta el plan según tus sensaciones.
+Bot de Telegram que hace de entrenador y nutricionista. Gestiona un plan **cíclico** de gimnasio, carrera, natación y bici para mejorar la forma física y rendir al máximo corriendo, **sin competir**. Tú decides qué lleva cada día de la semana y tu rutina de gimnasio (ejercicios, series, repeticiones y pesos). Si conectas un **Garmin** (probado con el Forerunner 265), lee tus carreras, tus series de fuerza y tu estado de forma, ajusta pesos, ritmos y sesiones, y te manda los entrenos al reloj. Incluye una dieta de **volumen muy limpio** (de 79 a 81 kg), la lista de la compra de Mercadona y un **coach conversacional con Claude** que adapta el plan según tus sensaciones.
 
 ## Puesta en marcha
 
@@ -84,7 +84,7 @@ systemctl --user stop coach-bot       # pararlo
 | `/manana` | Sesión de mañana |
 | `/semana [nº]` | Resumen de la semana |
 | `/sensaciones` | Botones de energía y molestias; adapta la sesión de hoy con reglas fijas (sin IA) |
-| `/gym` | Detalle de la rutina de gimnasio de hoy |
+| `/gym` | Rutina de gimnasio de hoy (con tus pesos) |
 | `/ritmos` | Tabla de ritmos y zonas (carrera, natación, bici) |
 | `/bloque` | Bloque de 8 semanas actual y fecha del próximo test |
 | `/test 10k 44:30` | Registra un test (5k, 10k, media o km sueltos) y recalcula los ritmos |
@@ -92,6 +92,20 @@ systemctl --user stop coach-bot       # pararlo
 | `/saltar [día]` | Ese día descansas (por defecto, hoy) |
 | `/cambiar corta\|suave\|bici\|natacion [día]` | Versión corta, suave o alternativa sin impacto (`normal` la deja como estaba) |
 | `/deshacer [día\|semana]` | Quita los cambios |
+| `/semana_config` | Tu semana tipo: qué lleva cada día |
+| `/dia_config sabado carrera+gym:hombro` | Cambia un día de la semana tipo (`carrera`, `natacion`, `bici`, `descanso`, `gym:grupo`) |
+| `/semana_reset` | Vuelve a la semana tipo por defecto |
+| `/rutina [grupo]` | Tu rutina con el número (`#id`) de cada ejercicio |
+| `/rutina_add pecho "Press banca" 4x6-8 80kg` | Añade un ejercicio (opcional: `A`/`B`, `90s` o `2'` de descanso, `pc` = peso corporal, nota) |
+| `/rutina_edit 12 85kg` | Cambia un ejercicio: `4x8-10`, `85kg`, `A`/`B`/`AB`, `90s`, `nombre …`, `nota …`, `grupo x`, `orden n` |
+| `/rutina_del 12` | Quita un ejercicio |
+| `/rutina_borrar grupo` | Borra todos los ejercicios de un grupo |
+| `/rutina_importar [grupo]` | Copia la rutina por defecto para editarla |
+| `/series 12 80x8 80x8 80x7` | Apunta las series de hoy (o `8 8 7` con el peso objetivo) y ajusta el peso |
+| `/garmin` | Estado de Garmin; sincroniza actividades, estado de forma y reloj |
+| `/actividades [n]` | Últimas actividades del reloj con su análisis |
+| `/bienestar` | Readiness, HRV, sueño y Body Battery de la semana |
+| `/enviar_reloj` | Manda al reloj los entrenos de los próximos días |
 | `/hecho [nota]` | Marca el entreno de hoy como completado |
 | `/peso 79.4` | Registra tu peso |
 | `/grasa 12.5` | Registra tu % de grasa corporal |
@@ -105,7 +119,7 @@ systemctl --user stop coach-bot       # pararlo
 | `/perfil` | Tus datos actuales |
 | `/olvidar` | Borra la memoria de la conversación con el coach |
 
-Cada mañana (a las 08:30 con el `.env` de ejemplo) el bot te envía el entreno y el menú del día. Los sábados envía además la lista de la compra y el menú de la semana.
+Cada mañana (a las 08:30 con el `.env` de ejemplo) el bot te envía el entreno y el menú del día (y, con Garmin, tu estado de forma). Los sábados envía además la lista de la compra y el menú de la semana.
 
 ## 💬 Coach conversacional (Claude)
 
@@ -130,6 +144,59 @@ Sin API key el bot funciona igual: el texto libre te remite a `/sensaciones`, qu
 | `CLAUDE_MAX_MENSAJES_DIA` | `40` | Mensajes al coach por día |
 
 El coach recuerda los últimos mensajes de la conversación; `/olvidar` la borra.
+
+## 🗓️ Tu semana tipo y tu rutina
+
+**Semana tipo.** Cada día puede llevar uno o varios entrenos: `carrera`, `natacion`, `bici`, `descanso` o gimnasio de un grupo (`gym:pecho`, `gym:torso`…; si el grupo ya existe vale con el nombre). Se cambia con `/dia_config`:
+
+```
+/dia_config martes carrera
+/dia_config viernes gym:torso+bici
+/dia_config domingo descanso
+```
+
+La **primera carrera** de la semana es la sesión clave (larga, calidad o test); las demás son rodajes en Z2. Sin días de carrera no hay tests ni progresión de ritmos. `/semana_config` avisa si la semana queda mal montada (pierna el día antes de la carrera, sin descanso…). Lo que cambies se aplica a todo: sesiones, kcal, menú, compra, coach y reloj.
+
+**Rutina de gimnasio.** Los grupos `pecho`, `espalda`, `pierna` y `hombro` tienen una rutina por defecto (A/B alternas). Para usar la tuya:
+
+1. `/rutina_importar` copia la de por defecto y la puedes editar, o crea grupos nuevos con `/rutina_add`.
+2. Cada ejercicio tiene series, rango de repeticiones, peso objetivo, descanso y variante (`A`, `B` o las dos).
+3. Tras cada sesión (del reloj o con `/series`) se aplica la **doble progresión**: si haces todas las series al máximo del rango, sube el peso (+2,5 kg; +5 kg en sentadilla, peso muerto, zancadas e hip thrust). Si quedas por debajo del mínimo dos sesiones seguidas, baja un 5 %. La primera vez que registras un ejercicio sin peso, fija el objetivo.
+
+## ⌚ Garmin (opcional)
+
+Usa la librería no oficial [`garminconnect`](https://github.com/cyberjunky/python-garminconnect): entra con tu cuenta de Garmin Connect como lo hace la app. Garmin no tiene API pública para particulares, así que puede dejar de funcionar si Garmin cambia algo; el bot sigue funcionando igual sin ella.
+
+**Qué hace:**
+
+- **Lee tus actividades** cada `GARMIN_SYNC_MIN` minutos. Al terminar un entreno te manda el análisis: volumen y ritmos frente a la sesión del plan, tramos rápidos, deriva cardiaca, series de fuerza ejercicio a ejercicio con el ajuste de peso, y un comentario del coach si tienes Claude. Marca la sesión como hecha.
+- **Detecta los tests**: si el día del test corres la distancia, guarda el tiempo y recalcula tus ritmos solo.
+- **Estado de forma**: por la mañana lee Training Readiness, HRV, sueño y Body Battery. Con readiness muy bajo pone descanso; si es bajo o la HRV va baja, versión suave; con menos de 5 h de sueño suaviza la carrera o la pierna. Solo una vez al día, antes de las 13:00 y si no has cambiado ya ese día (`/deshacer` lo revierte).
+- **Ritmos**: si tu último test tiene más de `TEST_VIGENCIA_DIAS` días, usa la predicción de media maratón del reloj.
+- **Entrenos al reloj**: sube al calendario de Garmin los entrenos de los próximos `GARMIN_DIAS_ENVIO` días: carreras con cada paso y su rango de ritmo, gimnasio con ejercicios, series, repeticiones, peso y descansos, natación y bici. Cuando cambias el plan, la semana o la rutina, actualiza solo lo que ha cambiado. Aparecen en el reloj al sincronizarlo con la app (Entrenamiento > Calendario).
+
+**Configuración:**
+
+1. Inicia sesión una vez (pide correo, contraseña y el código MFA si lo tienes); los tokens se guardan en `GARMIN_TOKENS_DIR` y duran meses. La contraseña no se guarda:
+   ```bash
+   .venv/bin/python garmin_login.py
+   ```
+2. Pon en `.env` tu `GARMIN_CHAT_ID` (si no lo sabes, `/garmin` te lo dice).
+3. Reinicia el bot y prueba `/garmin`.
+
+Para que el reloj registre bien las series de fuerza, empieza la actividad de *Fuerza* desde el entreno del calendario (o pulsa vuelta al acabar cada serie y revisa el ejercicio y el peso en la app). El bot empareja las series con tu rutina por el tipo de ejercicio; lo que no cuadre lo puedes apuntar con `/series`.
+
+| Variable | Por defecto | Descripción |
+|---|---|---|
+| `GARMIN_CHAT_ID` | `0` | Chat de Telegram vinculado a la cuenta de Garmin (0 = desactivado) |
+| `GARMIN_TOKENS_DIR` | `~/.garminconnect` | Carpeta de los tokens (fuera del repositorio) |
+| `GARMIN_EMAIL` / `GARMIN_PASSWORD` | _(vacías)_ | Solo si no usas `garmin_login.py` (no funciona con MFA) |
+| `GARMIN_SYNC_MIN` | `15` | Cada cuántos minutos mira si hay actividades nuevas |
+| `GARMIN_ENVIAR` | `1` | Mandar los entrenos al calendario del reloj (0 = no) |
+| `GARMIN_DIAS_ENVIO` | `7` | Días que se mandan por adelantado |
+| `GARMIN_AJUSTES` | `1` | Ajustar solo pesos y sesiones según los datos (0 = solo avisar) |
+| `GARMIN_USAR_PREDICCION` | `1` | Usar la predicción de media del reloj para los ritmos |
+| `TEST_VIGENCIA_DIAS` | `70` | Días que manda un test sobre la predicción del reloj |
 
 ## 🔀 Cambios en la semana
 
@@ -243,9 +310,9 @@ El bot puede guardar tus entrenos y métricas en Notion automáticamente. SQLite
 
 Si registras dos veces el mismo día, se actualiza la fila en vez de duplicarla. Las bases ya creadas no se migran: si las creaste con una versión anterior, Notion añade solas las fases nuevas al guardar. Desde Notion puedes crear gráficas de evolución, vistas de calendario o filtrar por tipo de entrenamiento.
 
-## Estructura semanal
+## Estructura semanal por defecto
 
-Pensada para una jornada de lunes a jueves de 8:00 a 17:30.
+Pensada para una jornada de lunes a jueves de 8:00 a 17:30. Puedes cambiarla con `/dia_config` (ver *Tu semana tipo y tu rutina*).
 
 | Día | Sesión |
 |---|---|
@@ -265,7 +332,7 @@ El gimnasio se hace con RIR 1-2 (dejando 1-2 repeticiones en reserva) y alterna 
 
 No hay fecha final: el plan se repite en **bloques de 8 semanas** (3 de carga + 1 de descarga, dos veces). En las descargas (semanas 4 y 8, marcadas con ⚠️) baja el volumen y se quita una serie en cada ejercicio de gimnasio.
 
-| Semana del bloque | Carrera del sábado |
+| Semana del bloque | Carrera principal (sábado por defecto) |
 |---|---|
 | 1 | Rodaje largo en Z2 |
 | 2 | Fartlek o tempo a umbral |
@@ -278,14 +345,14 @@ No hay fecha final: el plan se repite en **bloques de 8 semanas** (3 de carga + 
 
 El volumen de carrera crece de bloque en bloque (tirada larga de 10 a 17 km) hasta estabilizarse en el bloque 4. Fases: bloque 1 *Reconstrucción* (vuelves tras 2 meses sin correr apenas), bloque 2 *Base aeróbica* y desde el 3 *Desarrollo*.
 
-**Ritmos**: salen de tu último test (`/test`), convertido a ritmo equivalente de media maratón con la fórmula de Riegel. Hasta el primer test se usa tu marca de media (4:38 /km) más `DESENTRENO_SEC` (15 s/km). Las zonas Z1-Z4, ritmo medio y VO2 se calculan a partir de ahí.
+**Ritmos**: salen de tu último test (`/test` o detectado por el Garmin; si tiene más de `TEST_VIGENCIA_DIAS` días, de la predicción de media del reloj), convertido a ritmo equivalente de media maratón con la fórmula de Riegel. Hasta el primer test se usa tu marca de media (4:38 /km) más `DESENTRENO_SEC` (15 s/km). Las zonas Z1-Z4, ritmo medio y VO2 se calculan a partir de ahí.
 
 ## Personalización
 
 - **Fechas y horarios**: `.env` (`PLAN_START`, `REMINDER_HOUR`).
-- **Ejercicios de gimnasio**: `gym.py`.
-- **Sesiones de carrera**: `_carrera()` en `plan.py`; natación y bici, `datos_semana()`.
-- **Estructura de los días de la semana**: función `_sesion_base()` en `plan.py`.
+- **Semana tipo y rutina de gimnasio**: desde el bot (`/dia_config`, `/rutina_add`…). Las de por defecto están en `plan.ESTRUCTURA_DEFECTO` y `gym.py`.
+- **Sesiones de carrera**: `_carrera()` en `plan.py` (con los pasos que se mandan al reloj); natación y bici, `datos_semana()`.
+- **Reglas del entrenador** (progresión de pesos, análisis de carreras, estado de forma): `entrenador.py`.
 - **Perfil, marca de referencia y peso objetivo**: `config.py` y `.env`.
 - **Lo que sabe y cómo actúa el coach**: `INSTRUCCIONES` y `_contexto()` en `coach.py`.
 - **Alimentos, cantidades base y variantes de ahorro**: `alimentos.py`.
@@ -297,14 +364,18 @@ El volumen de carrera crece de bloque en bloque (tirada larga de 10 a 17 km) has
 bot.py          Handlers de Telegram, aviso diario y aviso de compra
 servicios.py    Acciones compartidas por los comandos y el coach
 coach.py        Coach conversacional con Claude (tool use)
-plan.py         Plan cíclico por bloques, ritmos y montaje de cada día
-gym.py          Rutinas de gimnasio A/B por grupo muscular
+plan.py         Plan cíclico por bloques, semana tipo configurable, ritmos y montaje de cada día
+gym.py          Rutinas de gimnasio A/B por defecto por grupo muscular
+entrenador.py   Reglas del entrenador: progresión de pesos, análisis de actividades, estado de forma
+garmin.py       Cliente de Garmin Connect: lectura de actividades y bienestar, entrenos al reloj
+garmin_ejercicios.py  Nombre del ejercicio -> categoría de Garmin
+garmin_login.py Inicio de sesión en Garmin (una vez) para guardar los tokens
 nutricion.py    Kcal y macros por día según el entreno; ajuste por peso
 menu.py         Menú diario por comidas (gramos de cada alimento)
 alimentos.py    Catálogo de alimentos (macros y cómo buscarlos en Mercadona)
 mercadona.py    Cliente de la API de Mercadona con caché en SQLite
 compra.py       Cálculo de cantidades y lista de la compra con presupuesto
-db.py           Persistencia SQLite (métricas, entrenos, tests, sensaciones, cambios, conversación y caché)
+db.py           Persistencia SQLite (métricas, entrenos, tests, sensaciones, cambios, semana tipo, rutina, series, Garmin, conversación y caché)
 notion_sync.py  Espejo en Notion
 config.py       Configuración y perfil
 ```

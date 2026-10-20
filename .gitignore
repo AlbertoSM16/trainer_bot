@@ -6,3 +6,4 @@ __pycache__/
 notion_dbs.json
 
 *.log
+.garminconnect/

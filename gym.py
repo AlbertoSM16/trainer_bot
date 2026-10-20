@@ -1,8 +1,9 @@
-"""Rutinas de gimnasio (4 días/semana, alternancia A/B semana a semana).
+"""Rutinas de gimnasio por defecto (4 días/semana, alternancia A/B semana a semana).
 
 Orden semanal: pecho + tríceps (L), espalda + bíceps (M), pierna (X) y hombro + core
 (S, después de correr). Enfoque de hipertrofia: básicos a 6-8 reps y accesorios a 8-15
-con RIR 1-2.
+con RIR 1-2. Cada usuario puede sustituirlas por su rutina propia (tabla `rutina`, ver
+`servicios.rutinas`), que llega a `formatear` como `propia`.
 """
 
 PIERNA = {
@@ -108,17 +109,47 @@ HOMBRO_CORE = {
 }
 
 
-def bloque(grupo: str, variante: str) -> dict:
-    return {
-        "pierna": PIERNA,
-        "pecho": PECHO_TRICEPS,
-        "espalda": ESPALDA_BICEPS,
-        "hombro": HOMBRO_CORE,
-    }[grupo][variante]
+GRUPOS = {
+    "pierna": PIERNA,
+    "pecho": PECHO_TRICEPS,
+    "espalda": ESPALDA_BICEPS,
+    "hombro": HOMBRO_CORE,
+}
+
+TITULOS = {
+    "pecho": "Pecho y tríceps",
+    "espalda": "Espalda y bíceps",
+    "pierna": "Pierna",
+    "hombro": "Hombro y core",
+}
 
 
-def formatear(grupo: str, variante: str) -> str:
-    b = bloque(grupo, variante)
+def titulo(grupo: str) -> str:
+    return TITULOS.get(grupo, grupo.replace("_", " ").capitalize())
+
+
+def zona(grupo: str) -> str:
+    """superior | pierna | completo, deducido del nombre del grupo."""
+    g = grupo.lower()
+    if any(k in g for k in ("full", "complet", "cuerpo", "total")):
+        return "completo"
+    if any(k in g for k in ("pierna", "leg", "gluteo", "cuadriceps", "femoral", "inferior")):
+        return "pierna"
+    return "superior"
+
+
+def bloque(grupo: str, variante: str) -> dict | None:
+    g = GRUPOS.get(grupo)
+    return g[variante] if g else None
+
+
+def formatear(grupo: str, variante: str, propia: dict | None = None) -> str:
+    """Rutina del grupo. `propia` ({variante: {"titulo", "ejercicios"}}) es la rutina del
+    usuario y tiene prioridad sobre la de este módulo."""
+    b = (propia or {}).get(variante) or bloque(grupo, variante)
+    if b is None:
+        return (f"Aún no tienes rutina para «{grupo}». Añádela con "
+                f"`/rutina_add {grupo} \"Ejercicio\" 4x8 60kg`.")
     lineas = [f"🏋️ *{b['titulo']}*", ""]
     lineas += [f"• {e}" for e in b["ejercicios"]]
     lineas.append("")

@@ -1,5 +1,7 @@
 """Persistencia en SQLite: usuarios, métricas, entrenos, cambios del plan, tests de carrera,
-sensaciones, platos cambiados y memoria del coach."""
+sensaciones, platos cambiados, memoria del coach, semana tipo y rutina de cada usuario,
+series hechas y datos de Garmin."""
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import date
@@ -91,10 +93,80 @@ CREATE TABLE IF NOT EXISTS coach_uso (
     mensajes  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, fecha)
 );
+CREATE TABLE IF NOT EXISTS semana_usuario (
+    chat_id  INTEGER NOT NULL,
+    dow      INTEGER NOT NULL,   -- 0 = lunes
+    orden    INTEGER NOT NULL,
+    tipo     TEXT NOT NULL,      -- gym | carrera | natacion | bici | descanso
+    grupo    TEXT,               -- grupo de gimnasio (solo tipo gym)
+    PRIMARY KEY (chat_id, dow, orden)
+);
+CREATE TABLE IF NOT EXISTS rutina (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    grupo       TEXT NOT NULL,
+    variante    TEXT,            -- A | B | NULL (las dos)
+    orden       INTEGER NOT NULL,
+    ejercicio   TEXT NOT NULL,
+    series      INTEGER NOT NULL,
+    reps_min    INTEGER NOT NULL, -- 0 = libre (ver nota)
+    reps_max    INTEGER NOT NULL,
+    peso_kg     REAL,
+    descanso_s  INTEGER NOT NULL DEFAULT 90,
+    garmin_cat  TEXT,             -- categoría de ejercicio de Garmin (o NULL)
+    nota        TEXT,
+    fallos      INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS series_hechas (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    fecha      TEXT NOT NULL,
+    rutina_id  INTEGER,
+    ejercicio  TEXT NOT NULL,
+    serie      INTEGER NOT NULL,
+    reps       INTEGER NOT NULL,
+    peso_kg    REAL,
+    origen     TEXT NOT NULL      -- manual | garmin
+);
+CREATE TABLE IF NOT EXISTS garmin_actividades (
+    id          INTEGER PRIMARY KEY,  -- activityId de Garmin
+    chat_id     INTEGER NOT NULL,
+    fecha       TEXT NOT NULL,
+    tipo        TEXT NOT NULL,        -- carrera | gym | natacion | bici | otro
+    nombre      TEXT,
+    distancia_m REAL,
+    duracion_s  REAL,
+    fc_media    REAL,
+    datos       TEXT,                 -- JSON con el resumen y las vueltas
+    analisis    TEXT
+);
+CREATE TABLE IF NOT EXISTS garmin_bienestar (
+    chat_id       INTEGER NOT NULL,
+    fecha         TEXT NOT NULL,
+    readiness     INTEGER,
+    readiness_txt TEXT,
+    hrv_estado    TEXT,
+    hrv_media     REAL,
+    sueno_h       REAL,
+    sueno_puntos  INTEGER,
+    body_battery  INTEGER,
+    pred_media_s  INTEGER,
+    aplicado      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_id, fecha)
+);
+CREATE TABLE IF NOT EXISTS garmin_programados (
+    chat_id     INTEGER NOT NULL,
+    fecha       TEXT NOT NULL,
+    clave       TEXT NOT NULL,       -- carrera | gym:pecho | natacion | bici
+    workout_id  INTEGER NOT NULL,
+    hash        TEXT NOT NULL,
+    PRIMARY KEY (chat_id, fecha, clave)
+);
 """
 # Versión del esquema (PRAGMA user_version). 2: semana nueva (L pecho … D bici), así que
 # los cambios guardados con el mapeo anterior dejan de tener sentido y se borran.
-VERSION = 2
+# 3: semana tipo y rutina por usuario, series y Garmin (solo tablas nuevas).
+VERSION = 3
 
 
 @contextmanager
@@ -166,6 +238,12 @@ def marcar_hecho(chat_id: int, fecha: date, titulo: str, nota: str = ""):
             "INSERT INTO entrenos (chat_id, fecha, titulo, nota) VALUES (?, ?, ?, ?) "
             "ON CONFLICT(chat_id, fecha) DO UPDATE SET titulo = excluded.titulo, nota = excluded.nota",
             (chat_id, fecha.isoformat(), titulo, nota))
+
+
+def entreno(chat_id: int, fecha: date) -> sqlite3.Row | None:
+    with conn() as c:
+        return c.execute("SELECT * FROM entrenos WHERE chat_id = ? AND fecha = ?",
+                         (chat_id, fecha.isoformat())).fetchone()
 
 
 def entrenos_entre(chat_id: int, desde: date, hasta: date) -> list[sqlite3.Row]:
@@ -371,3 +449,217 @@ def productos_en(categorias: list[int]) -> list[sqlite3.Row]:
     with conn() as c:
         return list(c.execute(
             f"SELECT * FROM mercadona_productos WHERE categoria IN ({marcas})", categorias))
+
+
+# ---------- semana tipo ----------
+
+def semana_usuario(chat_id: int) -> dict[int, list[tuple[str, str | None]]] | None:
+    """{dow: [(tipo, grupo)]} o None si el usuario usa la semana por defecto."""
+    with conn() as c:
+        filas = c.execute("SELECT dow, tipo, grupo FROM semana_usuario WHERE chat_id = ? "
+                          "ORDER BY dow, orden", (chat_id,)).fetchall()
+    if not filas:
+        return None
+    out: dict[int, list] = {i: [] for i in range(7)}
+    for f in filas:
+        out[f["dow"]].append((f["tipo"], f["grupo"]))
+    return out
+
+
+def guardar_semana(chat_id: int, dias: dict[int, list[tuple[str, str | None]]] | None):
+    """Guarda la semana completa (None vuelve a la de por defecto)."""
+    with conn() as c:
+        c.execute("DELETE FROM semana_usuario WHERE chat_id = ?", (chat_id,))
+        for dow, items in (dias or {}).items():
+            for i, (tipo, grupo) in enumerate(items or [("descanso", None)]):
+                c.execute("INSERT INTO semana_usuario (chat_id, dow, orden, tipo, grupo) "
+                          "VALUES (?, ?, ?, ?, ?)", (chat_id, dow, i, tipo, grupo))
+
+
+# ---------- rutina ----------
+
+CAMPOS_RUTINA = ("grupo", "variante", "orden", "ejercicio", "series", "reps_min", "reps_max",
+                 "peso_kg", "descanso_s", "garmin_cat", "nota", "fallos")
+
+
+def rutina(chat_id: int, grupo: str | None = None) -> list[sqlite3.Row]:
+    with conn() as c:
+        if grupo:
+            return c.execute("SELECT * FROM rutina WHERE chat_id = ? AND grupo = ? "
+                             "ORDER BY grupo, orden, id", (chat_id, grupo)).fetchall()
+        return c.execute("SELECT * FROM rutina WHERE chat_id = ? ORDER BY grupo, orden, id",
+                         (chat_id,)).fetchall()
+
+
+def ejercicio(chat_id: int, rutina_id: int) -> sqlite3.Row | None:
+    with conn() as c:
+        return c.execute("SELECT * FROM rutina WHERE chat_id = ? AND id = ?",
+                         (chat_id, rutina_id)).fetchone()
+
+
+def anadir_ejercicio(chat_id: int, **campos) -> int:
+    with conn() as c:
+        if campos.get("orden") is None:
+            campos["orden"] = c.execute(
+                "SELECT COALESCE(MAX(orden), 0) + 1 FROM rutina WHERE chat_id = ? AND grupo = ?",
+                (chat_id, campos["grupo"])).fetchone()[0]
+        nombres = [k for k in CAMPOS_RUTINA if k in campos]
+        cur = c.execute(
+            f"INSERT INTO rutina (chat_id, {', '.join(nombres)}) "
+            f"VALUES (?, {', '.join('?' for _ in nombres)})",
+            (chat_id, *[campos[k] for k in nombres]))
+        return cur.lastrowid
+
+
+def editar_ejercicio(chat_id: int, rutina_id: int, **campos):
+    nombres = [k for k in CAMPOS_RUTINA if k in campos]
+    if not nombres:
+        return
+    with conn() as c:
+        c.execute(f"UPDATE rutina SET {', '.join(f'{k} = ?' for k in nombres)} "
+                  "WHERE chat_id = ? AND id = ?",
+                  (*[campos[k] for k in nombres], chat_id, rutina_id))
+
+
+def borrar_ejercicio(chat_id: int, rutina_id: int) -> bool:
+    with conn() as c:
+        return c.execute("DELETE FROM rutina WHERE chat_id = ? AND id = ?",
+                         (chat_id, rutina_id)).rowcount > 0
+
+
+def borrar_grupo(chat_id: int, grupo: str) -> int:
+    with conn() as c:
+        return c.execute("DELETE FROM rutina WHERE chat_id = ? AND grupo = ?",
+                         (chat_id, grupo)).rowcount
+
+
+# ---------- series hechas ----------
+
+def guardar_series(chat_id: int, fecha: date, series: list[dict], origen: str):
+    """`series`: [{rutina_id, ejercicio, serie, reps, peso_kg}]. Sustituye las del mismo
+    origen, día y ejercicio."""
+    with conn() as c:
+        for clave in {(s["rutina_id"], s["ejercicio"]) for s in series}:
+            c.execute("DELETE FROM series_hechas WHERE chat_id = ? AND fecha = ? AND origen = ? "
+                      "AND ejercicio = ? AND rutina_id IS ?",
+                      (chat_id, fecha.isoformat(), origen, clave[1], clave[0]))
+        for s in series:
+            c.execute("INSERT INTO series_hechas (chat_id, fecha, rutina_id, ejercicio, serie, "
+                      "reps, peso_kg, origen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (chat_id, fecha.isoformat(), s["rutina_id"], s["ejercicio"], s["serie"],
+                       s["reps"], s["peso_kg"], origen))
+
+
+def series_de(chat_id: int, rutina_id: int, limite: int = 3) -> list[tuple[str, list[sqlite3.Row]]]:
+    """Últimas `limite` sesiones de un ejercicio: [(fecha, [series])], de la más reciente."""
+    with conn() as c:
+        fechas = [r[0] for r in c.execute(
+            "SELECT DISTINCT fecha FROM series_hechas WHERE chat_id = ? AND rutina_id = ? "
+            "ORDER BY fecha DESC LIMIT ?", (chat_id, rutina_id, limite))]
+        return [(f, c.execute("SELECT * FROM series_hechas WHERE chat_id = ? AND rutina_id = ? "
+                              "AND fecha = ? ORDER BY serie", (chat_id, rutina_id, f)).fetchall())
+                for f in fechas]
+
+
+# ---------- Garmin ----------
+
+def actividad_existe(actividad_id: int) -> bool:
+    with conn() as c:
+        return c.execute("SELECT 1 FROM garmin_actividades WHERE id = ?",
+                         (actividad_id,)).fetchone() is not None
+
+
+def hay_actividades(chat_id: int) -> bool:
+    with conn() as c:
+        return c.execute("SELECT 1 FROM garmin_actividades WHERE chat_id = ? LIMIT 1",
+                         (chat_id,)).fetchone() is not None
+
+
+def guardar_actividad(chat_id: int, a: dict, analisis: str = ""):
+    with conn() as c:
+        c.execute("INSERT OR REPLACE INTO garmin_actividades (id, chat_id, fecha, tipo, nombre, "
+                  "distancia_m, duracion_s, fc_media, datos, analisis) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (a["id"], chat_id, a["fecha"], a["tipo"], a.get("nombre"), a.get("distancia_m"),
+                   a.get("duracion_s"), a.get("fc_media"), json.dumps(a, ensure_ascii=False),
+                   analisis))
+
+
+def actividades(chat_id: int, desde: date | None = None, limite: int = 10) -> list[dict]:
+    with conn() as c:
+        filas = c.execute("SELECT datos, analisis FROM garmin_actividades WHERE chat_id = ? "
+                          "AND fecha >= ? ORDER BY fecha DESC, id DESC LIMIT ?",
+                          (chat_id, (desde or date.min).isoformat(), limite)).fetchall()
+    return [{**json.loads(f["datos"]), "analisis": f["analisis"]} for f in filas]
+
+
+def actividad(chat_id: int, actividad_id: int) -> dict | None:
+    with conn() as c:
+        f = c.execute("SELECT datos, analisis FROM garmin_actividades WHERE chat_id = ? AND id = ?",
+                      (chat_id, actividad_id)).fetchone()
+    return {**json.loads(f["datos"]), "analisis": f["analisis"]} if f else None
+
+
+CAMPOS_BIENESTAR = ("readiness", "readiness_txt", "hrv_estado", "hrv_media", "sueno_h",
+                    "sueno_puntos", "body_battery", "pred_media_s")
+
+
+def guardar_bienestar(chat_id: int, fecha: date, datos: dict):
+    """Fusiona los datos del día (los None no pisan valores ya guardados)."""
+    nombres = [k for k in CAMPOS_BIENESTAR if k in datos]
+    with conn() as c:
+        c.execute("INSERT OR IGNORE INTO garmin_bienestar (chat_id, fecha) VALUES (?, ?)",
+                  (chat_id, fecha.isoformat()))
+        if nombres:
+            c.execute(f"UPDATE garmin_bienestar SET "
+                      f"{', '.join(f'{k} = COALESCE(?, {k})' for k in nombres)} "
+                      "WHERE chat_id = ? AND fecha = ?",
+                      (*[datos[k] for k in nombres], chat_id, fecha.isoformat()))
+
+
+def bienestar(chat_id: int, fecha: date) -> sqlite3.Row | None:
+    with conn() as c:
+        return c.execute("SELECT * FROM garmin_bienestar WHERE chat_id = ? AND fecha = ?",
+                         (chat_id, fecha.isoformat())).fetchone()
+
+
+def bienestar_desde(chat_id: int, desde: date) -> list[sqlite3.Row]:
+    with conn() as c:
+        return c.execute("SELECT * FROM garmin_bienestar WHERE chat_id = ? AND fecha >= ? "
+                         "ORDER BY fecha", (chat_id, desde.isoformat())).fetchall()
+
+
+def marcar_bienestar_aplicado(chat_id: int, fecha: date):
+    with conn() as c:
+        c.execute("UPDATE garmin_bienestar SET aplicado = 1 WHERE chat_id = ? AND fecha = ?",
+                  (chat_id, fecha.isoformat()))
+
+
+def ultima_prediccion(chat_id: int) -> tuple[date, int] | None:
+    with conn() as c:
+        f = c.execute("SELECT fecha, pred_media_s FROM garmin_bienestar WHERE chat_id = ? "
+                      "AND pred_media_s IS NOT NULL ORDER BY fecha DESC LIMIT 1",
+                      (chat_id,)).fetchone()
+    return (date.fromisoformat(f["fecha"]), f["pred_media_s"]) if f else None
+
+
+def programados(chat_id: int, desde: date | None = None,
+                hasta: date | None = None) -> list[sqlite3.Row]:
+    with conn() as c:
+        return c.execute("SELECT * FROM garmin_programados WHERE chat_id = ? AND fecha >= ? "
+                         "AND fecha <= ? ORDER BY fecha",
+                         (chat_id, (desde or date.min).isoformat(),
+                          (hasta or date.max).isoformat())).fetchall()
+
+
+def guardar_programado(chat_id: int, fecha: date, clave: str, workout_id: int, hash_: str):
+    with conn() as c:
+        c.execute("INSERT OR REPLACE INTO garmin_programados (chat_id, fecha, clave, workout_id, "
+                  "hash) VALUES (?, ?, ?, ?, ?)",
+                  (chat_id, fecha.isoformat(), clave, workout_id, hash_))
+
+
+def borrar_programado(chat_id: int, fecha: str, clave: str):
+    with conn() as c:
+        c.execute("DELETE FROM garmin_programados WHERE chat_id = ? AND fecha = ? AND clave = ?",
+                  (chat_id, fecha, clave))

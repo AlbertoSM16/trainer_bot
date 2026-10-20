@@ -1,18 +1,24 @@
 """Plan cíclico de entrenamiento: gimnasio + carrera + natación + bici.
 
-Estructura semanal fija (jornada de lunes a jueves de 8:00 a 17:30):
+La semana tipo es una `Estructura`: qué lleva cada día (gimnasio de un grupo, carrera,
+natación, bici o descanso). Cada usuario puede configurar la suya; por defecto
+(`ESTRUCTURA_DEFECTO`, jornada de lunes a jueves de 8:00 a 17:30):
   Lunes      -> Gimnasio PECHO + TRÍCEPS
   Martes     -> Gimnasio ESPALDA + BÍCEPS
   Miércoles  -> Gimnasio PIERNA
   Jueves     -> NATACIÓN
   Viernes    -> DESCANSO flexible (hueco para recuperar una sesión movida o saltada)
-  Sábado     -> CARRERA (la única de la semana) + Gimnasio HOMBRO + CORE
+  Sábado     -> CARRERA (la principal de la semana) + Gimnasio HOMBRO + CORE
   Domingo    -> BICI
 
 No hay fecha final: el plan se repite en bloques de 8 semanas (3 de carga + 1 de
-descarga, dos veces). El sábado de la semana 8 hay un test de 5 km (bloques impares)
-o 10 km (pares) que sirve para recalcular los ritmos. El volumen de carrera crece de
+descarga, dos veces). El primer día de carrera de la semana lleva la sesión clave; en la
+semana 8 es un test de 5 km (bloques impares) o 10 km (pares) que sirve para recalcular
+los ritmos. Otros días de carrera son rodajes en Z2. El volumen de carrera crece de
 bloque en bloque hasta `NIVEL_MAX`.
+
+Las sesiones incluyen `entrenos`: la versión estructurada (pasos de carrera con zonas,
+grupo de gimnasio, minutos de cardio) que se envía al reloj.
 
 Los ritmos salen de `ref`: el ritmo equivalente de media maratón en s/km
 (ver `ritmo_ref`). Sin `ref` se usa la marca de config más un margen por desentreno.
@@ -22,7 +28,7 @@ guardan fuera (SQLite) y llegan aquí como `Cambio`: el día hace la sesión bas
 `origen` (dentro de la misma semana) en el `modo` indicado.
 """
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import gym
@@ -54,6 +60,80 @@ MODOS = {
 class Cambio:
     origen: date              # día del plan cuya sesión se hace
     modo: str | None = None   # None o una clave de MODOS
+
+
+# ---------- estructura semanal ----------
+
+TIPOS = {
+    "gym": "Gimnasio",
+    "carrera": "Carrera",
+    "natacion": "Natación",
+    "bici": "Bici",
+    "descanso": "Descanso",
+}
+
+Item = tuple[str, str | None]  # (tipo, grupo de gimnasio o None)
+
+
+@dataclass(frozen=True)
+class Estructura:
+    """Qué lleva cada día de la semana (0 = lunes) y las rutinas propias de gimnasio
+    (`{grupo: {variante: {"titulo", "ejercicios", "filas"}}}`, ver `gym.formatear`)."""
+    dias: tuple[tuple[Item, ...], ...]
+    rutinas: dict = field(default_factory=dict, compare=False, hash=False)
+
+    def items(self, dow: int) -> tuple[Item, ...]:
+        return self.dias[dow] or (("descanso", None),)
+
+    def tipos(self, dow: int) -> set[str]:
+        tipos = {t for t, _ in self.items(dow)}
+        return tipos - {"descanso"} or {"descanso"}
+
+    def grupos(self, dow: int) -> list[str]:
+        return [g for t, g in self.items(dow) if t == "gym" and g]
+
+    def dia_carrera(self) -> int | None:
+        """Día de la carrera principal (la primera de la semana)."""
+        return next((i for i in range(7) if "carrera" in self.tipos(i)), None)
+
+    def descanso(self, dow: int) -> bool:
+        return self.tipos(dow) == {"descanso"}
+
+    def pierna(self, dow: int) -> bool:
+        return any(gym.zona(g) != "superior" for g in self.grupos(dow))
+
+
+ESTRUCTURA_DEFECTO = Estructura((
+    (("gym", "pecho"),),
+    (("gym", "espalda"),),
+    (("gym", "pierna"),),
+    (("natacion", None),),
+    (("descanso", None),),
+    (("carrera", None), ("gym", "hombro")),
+    (("bici", None),),
+))
+
+
+def _est(est: Estructura | None) -> Estructura:
+    return est or ESTRUCTURA_DEFECTO
+
+
+def avisos_estructura(est: Estructura) -> list[str]:
+    """Problemas de una semana tipo (no impiden guardarla)."""
+    out = []
+    dc = est.dia_carrera()
+    if dc is None:
+        out.append("No hay ningún día de carrera: sin carrera no hay tests ni progresión de ritmos.")
+    if not any(est.descanso(i) for i in range(7)):
+        out.append("No hay ningún día de descanso.")
+    for i in range(7):
+        sig = (i + 1) % 7
+        if est.pierna(i) and "carrera" in est.tipos(sig):
+            out.append(f"Pierna el {DIAS[i].lower()} y carrera el {DIAS[sig].lower()}: "
+                       "llegarás con las piernas cargadas.")
+        if est.pierna(i) and "carrera" in est.tipos(i):
+            out.append(f"Pierna y carrera el mismo día ({DIAS[i].lower()}): mucha carga.")
+    return out
 
 
 # ---------- ritmos ----------
@@ -119,67 +199,151 @@ def km_test(bloque: int) -> int:
     return 5 if bloque % 2 == 1 else 10
 
 
+# Pasos estructurados de carrera (para el reloj):
+#   ("calentamiento" | "intervalo" | "recuperacion" | "enfriamiento", (condición, valor), zona)
+#   ("repetir", veces, [pasos])
+# condición: "tiempo" (s), "distancia" (m) o "lap" (botón de vuelta). zona: clave de ZONAS o None.
+
+def _paso(tipo: str, cond: str, valor: float = 0, zona: str | None = None) -> tuple:
+    return (tipo, (cond, valor), zona)
+
+
+def _rep(veces: int, *pasos) -> tuple:
+    return ("repetir", veces, list(pasos))
+
+
+def _progresivos(n: int) -> tuple:
+    return _rep(n, _paso("intervalo", "tiempo", 20), _paso("recuperacion", "tiempo", 60))
+
+
+def _km(km: float) -> float:
+    return round(km * 1000)
+
+
+def escalar_pasos(pasos: list, f: float) -> list:
+    """Pasos con el volumen multiplicado por `f` (repeticiones, tiempos y distancias)."""
+    out = []
+    for p in pasos:
+        if p[0] == "repetir":
+            out.append(("repetir", max(1, round(p[1] * f)), p[2]))
+        else:
+            cond, valor = p[1]
+            nuevo = valor if cond == "lap" or p[0] == "recuperacion" else round(valor * f)
+            out.append((p[0], (cond, nuevo), p[2]))
+    return out
+
+
+def carrera_extra(ref: int, descarga: bool = False) -> dict:
+    """Rodaje para los días de carrera que no son el principal de la semana."""
+    m = 30 if descarga else 40
+    return {"tipo": "Rodaje Z2", "km": round(m / 6, 1),
+            "texto": f"{m}' en Z2 ({_r(ref, 'z2')}) + 4x20\" progresivos al acabar.",
+            "pasos": [_paso("intervalo", "tiempo", m * 60, "z2"), _progresivos(4)]}
+
+
 def _carrera(sb: int, bloque: int, ref: int) -> dict:
-    """Sesión de carrera del sábado: {tipo, texto, km}. `sb` = semana dentro del bloque."""
+    """Sesión de carrera principal de la semana: {tipo, texto, km, pasos}.
+    `sb` = semana dentro del bloque."""
     n = min(bloque, NIVEL_MAX) - 1
     z2, medio, media = _r(ref, "z2"), _r(ref, "medio"), _r(ref, "media")
     umbral, vo2 = _r(ref, "umbral"), _r(ref, "vo2")
+    cal = _paso("calentamiento", "tiempo", 900, "z2")
+    enf = _paso("enfriamiento", "tiempo", 600, "z2")
     if sb == 1:
         km = (8, 11, 13, 15)[n]
-        texto = (f"{km} km en Z2 ({z2}) + 6x20\" progresivos al acabar." if n == 0 else
-                 f"{km} km en Z2 ({z2}). Los 2 últimos a ritmo medio ({medio}).")
-        return {"tipo": "Rodaje largo", "texto": texto, "km": km}
+        if n == 0:
+            return {"tipo": "Rodaje largo", "km": km,
+                    "texto": f"{km} km en Z2 ({z2}) + 6x20\" progresivos al acabar.",
+                    "pasos": [_paso("intervalo", "distancia", _km(km), "z2"), _progresivos(6)]}
+        return {"tipo": "Rodaje largo", "km": km,
+                "texto": f"{km} km en Z2 ({z2}). Los 2 últimos a ritmo medio ({medio}).",
+                "pasos": [_paso("intervalo", "distancia", _km(km - 2), "z2"),
+                          _paso("intervalo", "distancia", _km(2), "medio")]}
     if sb == 2:
         if n == 0:
             return {"tipo": "Fartlek", "km": 7.5, "texto":
                     f"Rodaje 40': 10' en Z2 ({z2}) + 8x(1' a umbral {umbral} / 1' trote) "
-                    "+ 10' en Z2."}
+                    "+ 10' en Z2.",
+                    "pasos": [_paso("calentamiento", "tiempo", 600, "z2"),
+                              _rep(8, _paso("intervalo", "tiempo", 60, "umbral"),
+                                   _paso("recuperacion", "tiempo", 60)), enf]}
         reps, mins = ((3, 8), (3, 10), (2, 15))[n - 1]
         total = 25 + reps * mins + (reps - 1) * 2
         return {"tipo": "Tempo", "km": round(total / 5.3, 1), "texto":
                 f"15' en Z2 ({z2}) + {reps}x{mins}' a umbral ({umbral}) con 2' de trote "
-                "+ 10' en Z2."}
+                "+ 10' en Z2.",
+                "pasos": [cal, _rep(reps, _paso("intervalo", "tiempo", mins * 60, "umbral"),
+                                    _paso("recuperacion", "tiempo", 120)), enf]}
     if sb == 3:
         km, fin = ((10, 0), (13, 3), (15, 4), (17, 5))[n]
-        texto = (f"{km} km en Z2 ({z2}). Sin mirar el reloj: que sea cómodo." if not fin else
-                 f"{km} km: los {km - fin} primeros en Z2 ({z2}) y los {fin} últimos "
-                 f"a ritmo de media ({media}).")
-        return {"tipo": "Tirada larga", "texto": texto, "km": km}
+        if not fin:
+            return {"tipo": "Tirada larga", "km": km,
+                    "texto": f"{km} km en Z2 ({z2}). Sin mirar el reloj: que sea cómodo.",
+                    "pasos": [_paso("intervalo", "distancia", _km(km), "z2")]}
+        return {"tipo": "Tirada larga", "km": km,
+                "texto": f"{km} km: los {km - fin} primeros en Z2 ({z2}) y los {fin} últimos "
+                         f"a ritmo de media ({media}).",
+                "pasos": [_paso("intervalo", "distancia", _km(km - fin), "z2"),
+                          _paso("intervalo", "distancia", _km(fin), "media")]}
     if sb == 4:
         return {"tipo": "Rodaje suave", "km": 7, "texto":
-                f"Rodaje 40' en Z2 ({z2}) + 4x20\" progresivos. Descarga: sin forzar."}
+                f"Rodaje 40' en Z2 ({z2}) + 4x20\" progresivos. Descarga: sin forzar.",
+                "pasos": [_paso("intervalo", "tiempo", 2400, "z2"), _progresivos(4)]}
     if sb == 5:
         if n == 0:
             return {"tipo": "Series", "km": 8.5, "texto":
                     f"Rodaje 45': 12' en Z2 ({z2}) + 10x(1' a umbral {umbral} / 1' trote) "
-                    "+ 10' en Z2."}
-        series, rec, km = (("5x1000 m", "2'", 9), ("6x1000 m", "2'", 10),
-                           ("8x800 m", "90\"", 10))[n - 1]
+                    "+ 10' en Z2.",
+                    "pasos": [_paso("calentamiento", "tiempo", 720, "z2"),
+                              _rep(10, _paso("intervalo", "tiempo", 60, "umbral"),
+                                   _paso("recuperacion", "tiempo", 60)), enf]}
+        (veces, metros), rec, rec_s, km = (((5, 1000), "2'", 120, 9), ((6, 1000), "2'", 120, 10),
+                                           ((8, 800), "90\"", 90, 10))[n - 1]
         return {"tipo": "Series", "km": km, "texto":
-                f"15' en Z2 ({z2}) + {series} a ritmo VO2 ({vo2}) con {rec} de trote "
-                "+ 10' en Z2."}
+                f"15' en Z2 ({z2}) + {veces}x{metros} m a ritmo VO2 ({vo2}) con {rec} de trote "
+                "+ 10' en Z2.",
+                "pasos": [cal, _rep(veces, _paso("intervalo", "distancia", metros, "vo2"),
+                                    _paso("recuperacion", "tiempo", rec_s)), enf]}
     if sb == 6:
         km = (11, 14, 16, 18)[n]
-        texto = (f"{km} km: los {km - 3} primeros en Z2 ({z2}) y los 3 últimos a ritmo "
-                 f"medio ({medio})." if n == 0 else
-                 f"{km} km progresivos: un tercio en Z2 ({z2}), otro a ritmo medio ({medio}) "
-                 f"y el último a ritmo de media ({media}).")
-        return {"tipo": "Larga progresiva", "texto": texto, "km": km}
+        if n == 0:
+            return {"tipo": "Larga progresiva", "km": km,
+                    "texto": f"{km} km: los {km - 3} primeros en Z2 ({z2}) y los 3 últimos a "
+                             f"ritmo medio ({medio}).",
+                    "pasos": [_paso("intervalo", "distancia", _km(km - 3), "z2"),
+                              _paso("intervalo", "distancia", _km(3), "medio")]}
+        tercio = round(km / 3)
+        return {"tipo": "Larga progresiva", "km": km,
+                "texto": f"{km} km progresivos: un tercio en Z2 ({z2}), otro a ritmo medio "
+                         f"({medio}) y el último a ritmo de media ({media}).",
+                "pasos": [_paso("intervalo", "distancia", _km(tercio), "z2"),
+                          _paso("intervalo", "distancia", _km(tercio), "medio"),
+                          _paso("intervalo", "distancia", _km(km - 2 * tercio), "media")]}
     if sb == 7:
         if n == 0:
             return {"tipo": "Ritmo medio", "km": 9, "texto":
                     f"Rodaje 50': 15' en Z2 ({z2}) + 3x6' a ritmo medio ({medio}) con 2' "
-                    "de trote + 10' en Z2."}
+                    "de trote + 10' en Z2.",
+                    "pasos": [cal, _rep(3, _paso("intervalo", "tiempo", 360, "medio"),
+                                        _paso("recuperacion", "tiempo", 120)), enf]}
         km, reps, dist = ((13, 2, 3), (15, 3, 3), (17, 3, 4))[n - 1]
+        resto = km - 4 - reps * dist
         return {"tipo": "Ritmo de media", "km": km, "texto":
                 f"{km} km: 4 en Z2 ({z2}) + {reps}x{dist} km a ritmo de media ({media}) "
-                "con 3' de trote + el resto en Z2."}
+                "con 3' de trote + el resto en Z2.",
+                "pasos": [_paso("calentamiento", "distancia", _km(4), "z2"),
+                          _rep(reps, _paso("intervalo", "distancia", _km(dist), "media"),
+                               _paso("recuperacion", "tiempo", 180)),
+                          _paso("enfriamiento", "distancia", _km(resto), "z2") if resto > 0
+                          else _paso("enfriamiento", "lap")]}
     d = km_test(bloque)
     salida = pace(round(tiempo_previsto(ref, d) / d))
     return {"tipo": f"Test {d} km", "km": d + 5, "texto":
             f"15' en Z2 + 4x20\" progresivos + {d} km a tope y lo más uniforme posible "
             f"(sal a {salida} /km y aprieta en el último km) + 10' muy suave. "
-            f"Después registra el tiempo: `/test {d}k mm:ss`."}
+            f"Después registra el tiempo: `/test {d}k mm:ss`.",
+            "pasos": [cal, _progresivos(4), _paso("intervalo", "distancia", _km(d)),
+                      _paso("enfriamiento", "tiempo", 600, "z1")]}
 
 
 def semana_indice(dia: date) -> int:
@@ -199,12 +363,15 @@ def variante(week_num: int) -> str:
     return "A" if week_num % 2 == 1 else "B"
 
 
-def datos_semana(week_num: int, ref: int | None = None) -> dict | None:
+def datos_semana(week_num: int, ref: int | None = None,
+                 est: Estructura | None = None) -> dict | None:
     if week_num < 1:
         return None
+    est = _est(est)
     ref = ref or ritmo_ref()
     b, sb = bloque_de(week_num), semana_en_bloque(week_num)
     descarga = sb in SEMANAS_DESCARGA
+    dc = est.dia_carrera()
     nata, bici = _SECUENCIA_NATA[sb - 1], _SECUENCIA_BICI[sb - 1]
     if b == 1:
         nata = "base" if nata == "fuerte" else nata
@@ -219,15 +386,18 @@ def datos_semana(week_num: int, ref: int | None = None) -> dict | None:
     if descarga:
         notas.append("SEMANA DE DESCARGA: un 30 % menos de volumen y una serie menos por "
                      "ejercicio en el gimnasio.")
-    if sb == SEMANAS_BLOQUE:
-        notas.append(f"El sábado toca test de {km_test(b)} km: que el viernes sea descanso de "
-                     "verdad. Con el resultado se recalculan tus ritmos.")
+    if sb == SEMANAS_BLOQUE and dc is not None:
+        previo = (dc - 1) % 7
+        antes = "descanso de verdad" if est.descanso(previo) else "suave (o descanso)"
+        notas.append(f"El {DIAS[dc].lower()} toca test de {km_test(b)} km: que el "
+                     f"{DIAS[previo].lower()} sea {antes}. Con el resultado se recalculan "
+                     "tus ritmos.")
     return {
         "fase": min(b, len(FASES)),
         "bloque": b,
         "semana_bloque": sb,
         "descarga": descarga,
-        "test": sb == SEMANAS_BLOQUE,
+        "test": sb == SEMANAS_BLOQUE and dc is not None,
         "carrera": _carrera(sb, b, ref),
         "nata": NATA[nata],
         "bici": BICI[bici],
@@ -239,47 +409,87 @@ def fecha_lunes(week_num: int) -> date:
     return PLAN_START + timedelta(weeks=week_num - 1)
 
 
-def proximo_test(dia: date) -> tuple[date, int]:
-    """Fecha y distancia (km) del próximo test a partir de `dia` (incluido)."""
+def proximo_test(dia: date, est: Estructura | None = None) -> tuple[date, int] | None:
+    """Fecha y distancia (km) del próximo test a partir de `dia` (incluido).
+    None si la semana tipo no tiene carrera."""
+    dc = _est(est).dia_carrera()
+    if dc is None:
+        return None
     wn = max(1, semana_indice(dia))
     b = bloque_de(wn)
-    sabado = fecha_lunes(b * SEMANAS_BLOQUE) + timedelta(days=5)
-    if dia > sabado:
+    fecha = fecha_lunes(b * SEMANAS_BLOQUE) + timedelta(days=dc)
+    if dia > fecha:
         b += 1
-        sabado += timedelta(weeks=SEMANAS_BLOQUE)
-    return sabado, km_test(b)
+        fecha += timedelta(weeks=SEMANAS_BLOQUE)
+    return fecha, km_test(b)
 
 
-def sesiones_dia(dia: date, cambio: Cambio | None = None, ref: int | None = None) -> dict:
+def carrera_de(dia: date, ref: int | None = None, est: Estructura | None = None) -> dict | None:
+    """Carrera que toca en `dia` según la semana tipo (sin cambios), o None."""
+    est = _est(est)
+    w = datos_semana(semana_indice(dia), ref, est)
+    if w is None or "carrera" not in est.tipos(dia.weekday()):
+        return None
+    if dia.weekday() == est.dia_carrera():
+        return w["carrera"]
+    return carrera_extra(ref or ritmo_ref(), w["descarga"])
+
+
+def minutos_texto(texto: str) -> int:
+    m = re.search(r"(\d+)'", texto)
+    return int(m.group(1)) if m else 0
+
+
+def _entreno_gym(grupo: str, var: str, descarga: bool) -> dict:
+    return {"tipo": "gym", "grupo": grupo, "variante": var, "series_menos": 1 if descarga else 0,
+            "carga": 1.0}
+
+
+def sesiones_dia(dia: date, cambio: Cambio | None = None, ref: int | None = None,
+                 est: Estructura | None = None) -> dict:
     """Sesión completa de un día, aplicando el cambio del usuario si lo hay."""
+    est = _est(est)
     if cambio is None or (cambio.origen == dia and cambio.modo is None):
-        return _sesion_base(dia, ref)
-    s = dict(_sesion_base(cambio.origen, ref))
+        return _sesion_base(dia, ref, est)
+    s = dict(_sesion_base(cambio.origen, ref, est))
     s["fecha"], s["origen"], s["modo"] = dia, cambio.origen, cambio.modo
     if s["fuera_de_plan"]:
         return s
     if cambio.origen != dia:
         s["titulo"] += f" (movida del {DIAS[cambio.origen.weekday()].lower()})"
-    dow = cambio.origen.weekday()
+    tipos = est.tipos(cambio.origen.weekday())
+    entrenos = [dict(e) for e in s["entrenos"]]
     if cambio.modo == "descanso":
         s["titulo"] = f"Descanso (saltas: {s['titulo']})"
         s["bloques"] = [("😴 Descanso", "Hoy no entrenas. Si te apetece, paseo o 10' de movilidad.")]
+        entrenos = []
     elif cambio.modo == "corta":
         s["titulo"] += " · versión corta"
         s["bloques"] = [("✂️ Versión corta",
                          "Haz la mitad del volumen: mitad de minutos, km o repeticiones de "
                          "carrera, y 1-2 series menos por ejercicio de gimnasio. "
                          "Mantén los ritmos e intensidades.")] + s["bloques"]
+        for e in entrenos:
+            if e["tipo"] == "carrera":
+                e["pasos"] = escalar_pasos(e["pasos"], 0.5)
+            elif e["tipo"] == "gym":
+                e["series_menos"] += 1
+            else:
+                e["minutos"] = max(15, round(e["minutos"] / 2))
     elif cambio.modo == "suave":
         s["titulo"] += " · versión suave"
-        if dow == 5:
-            w = datos_semana(semana_indice(cambio.origen), ref)
-            m = int(max(30, min(60, round(w["carrera"]["km"] * 6 * 0.7 / 5) * 5)))
+        if "carrera" in tipos:
+            c = carrera_de(cambio.origen, ref, est)
+            m = int(max(30, min(60, round(c["km"] * 6 * 0.7 / 5) * 5)))
             s["bloques"] = [("🐢 Rodaje suave",
                              f"{m}' en Z2 ({_r(ref or ritmo_ref(), 'z2')}) sin series ni cambios "
                              "de ritmo. Si algo duele al correr, para y cambia a bici.")] + [
                 b for b in s["bloques"] if b[0].startswith("🏋️")]
-        elif dow in (0, 1, 2):
+            for e in entrenos:
+                if e["tipo"] == "carrera":
+                    e["nombre"] = "Rodaje suave"
+                    e["pasos"] = [_paso("intervalo", "tiempo", m * 60, "z2")]
+        elif "gym" in tipos:
             s["bloques"] = [("🐢 Versión suave",
                              "Mismos ejercicios con un 30-40 % menos de carga, RIR 3-4 y sin "
                              "llegar al fallo. Si un ejercicio molesta, sáltalo.")] + s["bloques"]
@@ -287,8 +497,13 @@ def sesiones_dia(dia: date, cambio: Cambio | None = None, ref: int | None = None
             s["bloques"] = [("🐢 Versión suave",
                              "Mismo tiempo, todo en Z1-Z2 (RPE 4-5) y sin bloques fuertes.")
                             ] + s["bloques"]
+        for e in entrenos:
+            if e["tipo"] == "gym":
+                e["carga"] = 0.65
+            elif e["tipo"] in ("natacion", "bici"):
+                e["texto"] = "Todo en Z1-Z2 (RPE 4-5), sin bloques fuertes."
     elif cambio.modo in ("bici", "natacion"):
-        m = s["minutos"] = minutos_alternativa(cambio.origen)
+        m = s["minutos"] = minutos_alternativa(cambio.origen, est)
         original = s["titulo"]
         if cambio.modo == "bici":
             s["titulo"] = f"Bici Z2 (en lugar de: {original})"
@@ -297,13 +512,16 @@ def sesiones_dia(dia: date, cambio: Cambio | None = None, ref: int | None = None
             s["titulo"] = f"Natación (en lugar de: {original})"
             s["bloques"] = [("🏊 Natación", f"{m}': 300 calentamiento + series de 100-200 a "
                                            "RPE 6 con 20\" de descanso + 200 suave.")]
+        entrenos = [{"tipo": cambio.modo, "minutos": m, "texto": s["bloques"][0][1]}]
+    s["entrenos"] = entrenos
     return s
 
 
-def _sesion_base(dia: date, ref: int | None = None) -> dict:
+def _sesion_base(dia: date, ref: int | None = None, est: Estructura | None = None) -> dict:
     """Sesión del plan para un día, sin cambios del usuario."""
+    est = _est(est)
     wn = semana_indice(dia)
-    w = datos_semana(wn, ref)
+    w = datos_semana(wn, ref, est)
     dow = dia.weekday()
 
     if w is None:
@@ -314,48 +532,66 @@ def _sesion_base(dia: date, ref: int | None = None) -> dict:
             "fuera_de_plan": "pre",
             "titulo": "Fuera del plan",
             "bloques": [],
+            "entrenos": [],
         }
 
     var = variante(wn)
-    bloques = []
-    if dow == 0:
-        titulo = "Gimnasio · Pecho y tríceps"
-        bloques.append(("🏋️ Gimnasio", gym.formatear("pecho", var)))
-    elif dow == 1:
-        titulo = "Gimnasio · Espalda y bíceps"
-        bloques.append(("🏋️ Gimnasio", gym.formatear("espalda", var)))
-    elif dow == 2:
-        titulo = "Gimnasio · Pierna"
-        bloques.append(("🏋️ Gimnasio", gym.formatear("pierna", var)))
-        bloques.append(("🧘 Extra", "10' de movilidad de cadera y tobillo al terminar. "
-                                   "La pierna va el miércoles para llegar fresco a la carrera "
-                                   "del sábado."))
-    elif dow == 3:
-        titulo = "Natación"
-        bloques.append(("🏊 Natación", w["nata"]))
-        bloques.append(("🥤 Antes", "Tras el trabajo: merienda con hidratos 1-2 h antes de nadar."))
-    elif dow == 4:
-        titulo = "Descanso flexible"
+    tipos = est.tipos(dow)
+    dc = est.dia_carrera()
+    titulos, bloques, entrenos = [], [], []
+    c = carrera_de(dia, ref, est)
+    for tipo, grupo in est.items(dow):
+        if tipo == "gym" and grupo:
+            titulos.append(f"Gimnasio · {gym.titulo(grupo)}")
+            bloques.append(("🏋️ Gimnasio", gym.formatear(grupo, var, est.rutinas.get(grupo))))
+            entrenos.append(_entreno_gym(grupo, var, w["descarga"]))
+            if gym.zona(grupo) == "pierna" and "carrera" not in tipos:
+                extra = "10' de movilidad de cadera y tobillo al terminar."
+                if dc is not None and dc - dow >= 2:
+                    extra += (f" La pierna va el {DIAS[dow].lower()} para llegar fresco a la "
+                              f"carrera del {DIAS[dc].lower()}.")
+                bloques.append(("🧘 Extra", extra))
+        elif tipo == "natacion":
+            titulos.append("Natación")
+            bloques.append(("🏊 Natación", w["nata"]))
+            if dow <= 3:
+                bloques.append(("🥤 Antes", "Tras el trabajo: merienda con hidratos 1-2 h antes "
+                                           "de nadar."))
+            entrenos.append({"tipo": "natacion", "minutos": minutos_texto(w["nata"]) or 45,
+                             "texto": w["nata"]})
+        elif tipo == "carrera" and c:
+            titulos.append(f"Carrera · {c['tipo']}")
+            bloques.append((f"🏃 Carrera · {c['tipo']}", c["texto"]))
+            entrenos.append({"tipo": "carrera", "nombre": c["tipo"], "km": c["km"],
+                             "pasos": c["pasos"], "texto": c["texto"]})
+        elif tipo == "bici":
+            titulos.append("Bici")
+            bloques.append(("🚴 Bici", w["bici"]))
+            previo = (dow - 1) % 7
+            cargado = (f"Si vienes muy cargado del {DIAS[previo].lower()}"
+                       if "carrera" in est.tipos(previo) else "Si vienes muy cargado")
+            bloques.append(("😴 Alternativa", f"{cargado}, rueda en Z1 o descansa. Es una "
+                                             "opción válida."))
+            entrenos.append({"tipo": "bici", "minutos": minutos_texto(w["bici"]) or 60,
+                             "texto": w["bici"]})
+    if tipos == {"descanso"}:
+        titulos.append("Descanso flexible")
         bloques.append(("😴 Descanso", "Día libre. Si esta semana has saltado algo, este es el "
                                       "hueco para recuperarlo (`/mover`). Si no, descansa, "
                                       "pasea o haz 10' de movilidad."))
-    elif dow == 5:
-        c = w["carrera"]
-        titulo = f"Carrera · {c['tipo']} + Gimnasio · Hombro y core"
-        bloques.append((f"🏃 Carrera · {c['tipo']}", c["texto"]))
-        bloques.append(("🏋️ Gimnasio", gym.formatear("hombro", var)))
-        orden = "Corre primero. Hombro y core después (o por la tarde): no cargan las piernas."
-        if w["test"]:
+    if c and est.grupos(dow):
+        nombres = " y ".join(gym.titulo(g) for g in est.grupos(dow))
+        if est.pierna(dow):
+            orden = (f"Corre primero. {nombres} después (o por la tarde). Ojo: pierna y "
+                     "carrera el mismo día cargan mucho; baja el volumen si vas justo.")
+        else:
+            orden = f"Corre primero. {nombres} después (o por la tarde): no cargan las piernas."
+        if w["test"] and dow == dc:
             orden += " Tras el test, haz solo 2 series por ejercicio."
         bloques.append(("ℹ️ Orden", orden))
-        if c["km"] >= 15:
-            bloques.append(("🥤 Nutrición", "Pasas de 90': lleva agua y un gel o bebida "
-                                           "isotónica a partir del minuto 45."))
-    else:
-        titulo = "Bici"
-        bloques.append(("🚴 Bici", w["bici"]))
-        bloques.append(("😴 Alternativa", "Si vienes muy cargado del sábado, rueda en Z1 o "
-                                         "descansa. Es una opción válida."))
+    if c and c["km"] >= 15:
+        bloques.append(("🥤 Nutrición", "Pasas de 90': lleva agua y un gel o bebida "
+                                       "isotónica a partir del minuto 45."))
 
     if w["nota"] and dow == 0:
         bloques.append(("📌 Nota de la semana", w["nota"]))
@@ -363,7 +599,8 @@ def _sesion_base(dia: date, ref: int | None = None) -> dict:
     return {
         "fecha": dia, "semana": wn, "fase": w["fase"], "bloque": w["bloque"],
         "semana_bloque": w["semana_bloque"], "descarga": w["descarga"],
-        "fuera_de_plan": None, "titulo": titulo, "bloques": bloques, "nota": w["nota"],
+        "fuera_de_plan": None, "titulo": " + ".join(titulos), "bloques": bloques,
+        "nota": w["nota"], "entrenos": entrenos,
     }
 
 
@@ -373,8 +610,9 @@ def _cabecera_semana(week_num: int) -> str:
             f" · {FASES[w['fase']]}")
 
 
-def resumen_semana(week_num: int, cambios: dict[date, Cambio] | None = None) -> str:
-    w = datos_semana(week_num)
+def resumen_semana(week_num: int, cambios: dict[date, Cambio] | None = None,
+                   est: Estructura | None = None) -> str:
+    w = datos_semana(week_num, None, est)
     if w is None:
         return "Esa semana está fuera del plan."
     lunes = fecha_lunes(week_num)
@@ -389,7 +627,7 @@ def resumen_semana(week_num: int, cambios: dict[date, Cambio] | None = None) -> 
     for i in range(7):
         d = lunes + timedelta(days=i)
         c = (cambios or {}).get(d)
-        s = sesiones_dia(d, c)
+        s = sesiones_dia(d, c, None, est)
         marca = MODOS.get(c.modo, "🔀") + " " if c else ""
         lineas.append(f"*{DIAS[i]}* — {marca}{s['titulo']}")
     if w["nota"]:
@@ -400,7 +638,7 @@ def resumen_semana(week_num: int, cambios: dict[date, Cambio] | None = None) -> 
 
 
 def resumen_bloque(week_num: int, ref: int | None = None) -> str:
-    """Las 8 semanas del bloque de `week_num` con la carrera del sábado."""
+    """Las 8 semanas del bloque de `week_num` con su carrera principal."""
     wn = max(1, week_num)
     b = bloque_de(wn)
     primera = (b - 1) * SEMANAS_BLOQUE + 1
@@ -419,21 +657,25 @@ def resumen_bloque(week_num: int, ref: int | None = None) -> str:
     return "\n".join(out)
 
 
-def formatear_dia(dia: date, cambio: Cambio | None = None, ref: int | None = None) -> str:
-    s = sesiones_dia(dia, cambio, ref)
+def formatear_dia(dia: date, cambio: Cambio | None = None, ref: int | None = None,
+                  est: Estructura | None = None) -> str:
+    s = sesiones_dia(dia, cambio, ref, est)
     if s["fuera_de_plan"]:
         faltan = (PLAN_START - dia).days
         return (f"El plan arranca el lunes {PLAN_START.strftime('%d/%m/%Y')} "
                 f"(faltan {faltan} días). Usa /semana 1 para ver cómo empieza.")
-    test, km = proximo_test(dia)
-    if test == dia:
-        linea_test = f"⏱️ Hoy toca test de {km} km"
+    pt = proximo_test(dia, est)
+    if pt is None:
+        lineas_test = []
+    elif pt[0] == dia:
+        lineas_test = [f"⏱️ Hoy toca test de {pt[1]} km"]
     else:
-        linea_test = f"⏱️ Próximo test de {km} km: sábado {test.strftime('%d/%m')}"
+        lineas_test = [f"⏱️ Próximo test de {pt[1]} km: {DIAS[pt[0].weekday()].lower()} "
+                       f"{pt[0].strftime('%d/%m')}"]
     cab = [
         f"*{DIAS[dia.weekday()]} {dia.strftime('%d/%m/%Y')}*",
         _cabecera_semana(s["semana"]) + ("  ⚠️ DESCARGA" if s.get("descarga") else ""),
-        linea_test,
+        *lineas_test,
         "",
         f"👉 *{s['titulo']}*",
         "",
@@ -453,8 +695,10 @@ def fase_nombre_corto(fase: int | None) -> str | None:
     return FASES[fase].split(" · ", 1)[1]
 
 
-def tipos_dia(dia: date, cambio: Cambio | None = None) -> list[str]:
+def tipos_dia(dia: date, cambio: Cambio | None = None,
+              est: Estructura | None = None) -> list[str]:
     """Categorías de entrenamiento de un día, para etiquetar en Notion."""
+    est = _est(est)
     if cambio:
         especiales = {"descanso": ["Descanso"], "bici": ["Bici"], "natacion": ["Natación"]}
         if cambio.modo in especiales and datos_semana(semana_indice(dia)):
@@ -462,10 +706,11 @@ def tipos_dia(dia: date, cambio: Cambio | None = None) -> list[str]:
         dia = cambio.origen
     if datos_semana(semana_indice(dia)) is None:
         return []
-    return {
-        0: ["Gimnasio"], 1: ["Gimnasio"], 2: ["Gimnasio"], 3: ["Natación"],
-        4: ["Descanso"], 5: ["Carrera", "Gimnasio"], 6: ["Bici"],
-    }[dia.weekday()]
+    out = []
+    for t, _ in est.items(dia.weekday()):
+        if TIPOS[t] not in out and (t != "descanso" or est.descanso(dia.weekday())):
+            out.append(TIPOS[t])
+    return out
 
 
 def tabla_ritmos(ref: int | None = None, fuente: str = "") -> str:
@@ -495,22 +740,23 @@ def tabla_ritmos(ref: int | None = None, fuente: str = "") -> str:
 
 # ---------- cambios del usuario ----------
 
-def minutos_texto(texto: str) -> int:
-    m = re.search(r"(\d+)'", texto)
-    return int(m.group(1)) if m else 0
-
-
-def minutos_alternativa(origen: date) -> int:
+def minutos_alternativa(origen: date, est: Estructura | None = None) -> int:
     """Duración de la bici o natación que sustituye a la sesión de `origen`."""
-    w = datos_semana(semana_indice(origen))
+    est = _est(est)
+    w = datos_semana(semana_indice(origen), None, est)
     if w is None:
         return 30
-    m = {
-        3: minutos_texto(w["nata"]),
-        4: 30,
-        5: w["carrera"]["km"] * 6 * 1.2,
-        6: minutos_texto(w["bici"]) or 60,
-    }.get(origen.weekday(), 60)
+    tipos = est.tipos(origen.weekday())
+    if "carrera" in tipos:
+        m = carrera_de(origen, None, est)["km"] * 6 * 1.2
+    elif "natacion" in tipos:
+        m = minutos_texto(w["nata"])
+    elif "bici" in tipos:
+        m = minutos_texto(w["bici"]) or 60
+    elif tipos == {"descanso"}:
+        m = 30
+    else:
+        m = 60
     return int(max(30, min(120, round(m / 5) * 5)))
 
 
@@ -550,21 +796,31 @@ def aplicar(cambios: dict[date, Cambio], nuevos: dict[date, Cambio | None]) -> d
     return {d: c for d, c in out.items() if c is not None}
 
 
-def carga_dia(dia: date, cambios: dict[date, Cambio]) -> str:
+def carga_dia(dia: date, cambios: dict[date, Cambio], est: Estructura | None = None) -> str:
     """pierna | carrera | otra | ligera, según la sesión que se hace ese día."""
+    est = _est(est)
     c = efectivo(cambios, dia)
     if c.modo in ("descanso", "bici", "natacion"):
         return "ligera"
-    carga = {2: "pierna", 4: "ligera", 5: "carrera"}.get(c.origen.weekday(), "otra")
+    dow = c.origen.weekday()
+    if "carrera" in est.tipos(dow):
+        carga = "carrera"
+    elif est.pierna(dow):
+        carga = "pierna"
+    elif est.descanso(dow):
+        carga = "ligera"
+    else:
+        carga = "otra"
     return "otra" if c.modo == "suave" and carga != "ligera" else carga
 
 
-def avisos_semana(lunes: date, cambios: dict[date, Cambio]) -> list[str]:
+def avisos_semana(lunes: date, cambios: dict[date, Cambio],
+                  est: Estructura | None = None) -> list[str]:
     """Combinaciones poco recomendables tras los cambios de la semana."""
     if datos_semana(semana_indice(lunes)) is None:
         return []
     dias = [lunes + timedelta(days=i) for i in range(7)]
-    carga = [carga_dia(d, cambios) for d in dias]
+    carga = [carga_dia(d, cambios, est) for d in dias]
     out = []
     for i in range(6):
         nombres = f"{DIAS[i].lower()} y {DIAS[i + 1].lower()}"
@@ -578,7 +834,8 @@ def avisos_semana(lunes: date, cambios: dict[date, Cambio]) -> list[str]:
     return out
 
 
-def sugerir_recuperacion(cambios: dict[date, Cambio], saltado: date, desde: date) -> date | None:
+def sugerir_recuperacion(cambios: dict[date, Cambio], saltado: date, desde: date,
+                         est: Estructura | None = None) -> date | None:
     """Día de la semana (a partir de `desde`) más ligero para recuperar una sesión clave
     saltada sin generar avisos. None si no hay hueco razonable."""
     lunes = saltado - timedelta(days=saltado.weekday())
@@ -588,10 +845,10 @@ def sugerir_recuperacion(cambios: dict[date, Cambio], saltado: date, desde: date
         d = lunes + timedelta(days=i)
         if d < desde or d == saltado:
             continue
-        carga = carga_dia(d, cambios)
+        carga = carga_dia(d, cambios, est)
         if carga not in orden:
             continue
-        if not avisos_semana(lunes, aplicar(cambios, mover(cambios, saltado, d))):
+        if not avisos_semana(lunes, aplicar(cambios, mover(cambios, saltado, d)), est):
             candidatos.append((orden[carga], abs((d - saltado).days), d))
     return min(candidatos)[2] if candidatos else None
 
@@ -607,28 +864,33 @@ ZONAS_MOLESTIA = {
 
 
 def recomendar(dia: date, cambios: dict[date, Cambio], energia: int,
-               zona: str) -> tuple[str | None, str]:
+               zona: str, est: Estructura | None = None) -> tuple[str | None, str]:
     """Modo a aplicar a `dia` según cómo te encuentras (energía 1-5 y zona de molestia).
     Devuelve (modo, o None si no hace falta tocar nada; explicación)."""
+    est = _est(est)
     c = efectivo(cambios, dia)
-    if c.modo == "descanso" or (c.origen.weekday() == 4 and c.modo is None):
-        return None, "Hoy ya es de descanso: aprovecha para recuperar."
     dow = c.origen.weekday()
-    tren_superior = dow in (0, 1, 3)  # pecho, espalda, natación
-    impacto = dow in (2, 5)           # pierna, carrera
+    tipos = est.tipos(dow)
+    if c.modo == "descanso" or (tipos == {"descanso"} and c.modo is None):
+        return None, "Hoy ya es de descanso: aprovecha para recuperar."
+    grupos = est.grupos(dow)
+    superior = [g for g in grupos if gym.zona(g) != "pierna"]
+    impacto = "carrera" in tipos or est.pierna(dow)
+    tren_superior = "carrera" not in tipos and ("natacion" in tipos or bool(superior))
     if zona == "general" or energia <= 1:
         return "descanso", "Con malestar general o sin energía, lo que más suma es descansar."
     if zona == "piernas":
         if impacto:
             return "natacion", "Con molestias en las piernas, mejor sin impacto: natación suave."
-        if dow == 6:
+        if "bici" in tipos:
             return "suave", "Bici muy suave en Z1: si la molestia aumenta, para."
         return None, "La sesión de hoy no carga las piernas: puedes hacerla con normalidad."
     if zona == "superior":
         if tren_superior:
             return "bici", "Con molestias en el tren superior, cambia a bici en Z2."
-        if dow == 5:
-            return None, "Corre con normalidad y sáltate la parte de hombro si molesta."
+        if "carrera" in tipos and superior:
+            return None, (f"Corre con normalidad y sáltate la parte de "
+                          f"{' y '.join(superior)} si molesta.")
         return None, "La sesión de hoy apenas carga el tren superior: hazla sin forzar."
     if energia == 2:
         modo = "suave" if impacto else "corta"

@@ -13,7 +13,8 @@ FACTOR_NEAT = 1.35
 PROTEINA_G_KG = 2.0
 GRASA_G_KG = 0.9
 
-KCAL_GYM = {0: 300, 1: 300, 2: 350, 5: 250}  # pecho / espalda / pierna / hombro+core
+KCAL_GYM = {"pecho": 300, "espalda": 300, "pierna": 350, "hombro": 250}
+KCAL_GYM_OTRO = 300
 KCAL_MIN_BICI = 8
 KCAL_MIN_NATACION = 9
 KCAL_FUERA_DE_PLAN = 250  # actividad suave estimada antes del plan
@@ -54,52 +55,55 @@ def kg_semana_objetivo(peso: float) -> float:
     return 0.0 if peso >= PESO_OBJETIVO else OBJETIVO_KG_SEMANA
 
 
-def gasto_ejercicio(dia: date, peso: float, cambio: plan.Cambio | None = None) -> int:
+def gasto_ejercicio(dia: date, peso: float, cambio: plan.Cambio | None = None,
+                    est: plan.Estructura | None = None) -> int:
     """Estimación de las kcal gastadas en la sesión que se hace ese día (con los cambios)."""
+    est = est or plan.ESTRUCTURA_DEFECTO
     if cambio and plan.datos_semana(plan.semana_indice(dia)):
         if cambio.modo == "descanso":
             return 0
         if cambio.modo == "bici":
-            return plan.minutos_alternativa(cambio.origen) * KCAL_MIN_BICI
+            return plan.minutos_alternativa(cambio.origen, est) * KCAL_MIN_BICI
         if cambio.modo == "natacion":
-            return plan.minutos_alternativa(cambio.origen) * KCAL_MIN_NATACION
-        base = gasto_ejercicio(cambio.origen, peso)
+            return plan.minutos_alternativa(cambio.origen, est) * KCAL_MIN_NATACION
+        base = gasto_ejercicio(cambio.origen, peso, None, est)
         factor = {"corta": 0.5, "suave": 0.7}.get(cambio.modo, 1.0)
         return round(base * factor)
-    s = plan.sesiones_dia(dia)
+    s = plan.sesiones_dia(dia, None, None, est)
     if s["fuera_de_plan"]:
         return KCAL_FUERA_DE_PLAN
-    w = plan.datos_semana(s["semana"])
-    dow = dia.weekday()
-    gym = KCAL_GYM.get(dow, 0) * (0.8 if w["descarga"] else 1.0)
-    if dow == 3:
-        return round(_minutos(w["nata"]) * KCAL_MIN_NATACION)
-    if dow == 4:
-        return 0
-    if dow == 5:
-        return round(w["carrera"]["km"] * peso + gym)  # ~1 kcal por kg y km
-    if dow == 6:
-        return round(_minutos(w["bici"]) * KCAL_MIN_BICI)
-    return round(gym)
+    w = plan.datos_semana(s["semana"], None, est)
+    total = 0.0
+    for e in s["entrenos"]:
+        if e["tipo"] == "gym":
+            total += KCAL_GYM.get(e["grupo"], KCAL_GYM_OTRO) * (0.8 if w["descarga"] else 1.0)
+        elif e["tipo"] == "carrera":
+            total += e["km"] * peso  # ~1 kcal por kg y km
+        elif e["tipo"] == "natacion":
+            total += _minutos(w["nata"]) * KCAL_MIN_NATACION
+        elif e["tipo"] == "bici":
+            total += _minutos(w["bici"]) * KCAL_MIN_BICI
+    return round(total)
 
 
 def objetivo_dia(dia: date, peso: float, ajuste: int = 0,
-                 cambio: plan.Cambio | None = None) -> Objetivo:
+                 cambio: plan.Cambio | None = None, est: plan.Estructura | None = None) -> Objetivo:
     base = round(tmb(peso) * FACTOR_NEAT)
-    ejercicio = gasto_ejercicio(dia, peso, cambio)
+    ejercicio = gasto_ejercicio(dia, peso, cambio, est)
     sup = superavit(peso)
     kcal = round((base + ejercicio + sup + ajuste) / 50) * 50
     proteina = round(PROTEINA_G_KG * peso)
     grasa = round(GRASA_G_KG * peso)
     hidratos = max(0, round((kcal - proteina * 4 - grasa * 9) / 4))
-    return Objetivo(dia, plan.sesiones_dia(dia, cambio)["titulo"], base, ejercicio, sup,
-                    ajuste, kcal, proteina, grasa, hidratos, consejo(dia, cambio))
+    return Objetivo(dia, plan.sesiones_dia(dia, cambio, None, est)["titulo"], base, ejercicio,
+                    sup, ajuste, kcal, proteina, grasa, hidratos, consejo(dia, cambio, est))
 
 
 def objetivos_semana(desde: date, peso: float, ajuste: int = 0,
-                     cambios: dict[date, plan.Cambio] | None = None) -> list[Objetivo]:
+                     cambios: dict[date, plan.Cambio] | None = None,
+                     est: plan.Estructura | None = None) -> list[Objetivo]:
     dias = [desde + timedelta(days=i) for i in range(7)]
-    return [objetivo_dia(d, peso, ajuste, (cambios or {}).get(d)) for d in dias]
+    return [objetivo_dia(d, peso, ajuste, (cambios or {}).get(d), est) for d in dias]
 
 
 def nuevo_ajuste(pesos: list[tuple[date, float]], hoy: date, actual: int,
@@ -121,8 +125,10 @@ def nuevo_ajuste(pesos: list[tuple[date, float]], hoy: date, actual: int,
     return nuevo, f"Cambio semanal {cambio:+.2f} kg: {motivo} ({nuevo - actual:+d} kcal)."
 
 
-def consejo(dia: date, cambio: plan.Cambio | None = None) -> str:
-    s = plan.sesiones_dia(dia)
+def consejo(dia: date, cambio: plan.Cambio | None = None,
+            est: plan.Estructura | None = None) -> str:
+    est = est or plan.ESTRUCTURA_DEFECTO
+    s = plan.sesiones_dia(dia, None, None, est)
     if s["fuera_de_plan"]:
         return "Reparte la proteína en 4 tomas de 30-40 g."
     if cambio and cambio.modo in ("descanso", "bici", "natacion"):
@@ -130,19 +136,26 @@ def consejo(dia: date, cambio: plan.Cambio | None = None) -> str:
     if cambio:
         dia = cambio.origen
     dow = dia.weekday()
-    w = plan.datos_semana(plan.semana_indice(dia))
-    if dow == 5 and w and w["test"]:
-        return "Día de test: cena con hidratos el viernes y desayuno ligero 2-3 h antes."
-    return {
-        0: "Reparte la proteína en 4 tomas de 30-40 g. Hidratos alrededor del gimnasio.",
-        1: "Reparte la proteína en 4 tomas de 30-40 g. Hidratos alrededor del gimnasio.",
-        2: "Día de pierna: 30-40 g de proteína + hidratos justo después del gimnasio.",
-        3: "Natación tras el trabajo: merienda con hidratos 1-2 h antes.",
-        4: "Descanso: misma proteína, algo menos de hidratos. Buen día para cocinar.",
-        5: "Carrera + hombro: desayuno con hidratos 2-3 h antes (avena, plátano, miel) "
-           "y recupera con proteína + hidratos.",
-        6: "Bici: si pasa de 75', lleva agua y algo de hidratos.",
-    }[dow]
+    tipos = est.tipos(dow)
+    w = plan.datos_semana(plan.semana_indice(dia), None, est)
+    if "carrera" in tipos:
+        if dow == est.dia_carrera() and w and w["test"]:
+            return (f"Día de test: cena con hidratos el {plan.DIAS[(dow - 1) % 7].lower()} "
+                    "y desayuno ligero 2-3 h antes.")
+        grupos = est.grupos(dow)
+        que = "Carrera + " + " y ".join(grupos) if grupos else "Carrera"
+        return (f"{que}: desayuno con hidratos 2-3 h antes (avena, plátano, miel) "
+                "y recupera con proteína + hidratos.")
+    if est.pierna(dow):
+        return "Día de pierna: 30-40 g de proteína + hidratos justo después del gimnasio."
+    if "gym" in tipos:
+        return "Reparte la proteína en 4 tomas de 30-40 g. Hidratos alrededor del gimnasio."
+    if "natacion" in tipos:
+        return ("Natación tras el trabajo: merienda con hidratos 1-2 h antes." if dow <= 3 else
+                "Natación: come algo con hidratos 1-2 h antes.")
+    if "bici" in tipos:
+        return "Bici: si pasa de 75', lleva agua y algo de hidratos."
+    return "Descanso: misma proteína, algo menos de hidratos. Buen día para cocinar."
 
 
 def formatear_objetivo(o: Objetivo) -> str:

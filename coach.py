@@ -1,16 +1,19 @@
 """Coach conversacional con Claude (API de Anthropic) y tool use.
 
-Claude recibe el contexto del día (perfil, plan, sensaciones y dieta) y puede usar herramientas
-que llaman a `servicios`, igual que los comandos: adaptar la semana según las sensaciones,
-registrar peso, grasa, entrenos y tests, y cambiar platos del menú.
+Claude recibe el contexto del día (perfil, semana tipo, plan, sensaciones, actividades y estado
+de forma del Garmin, y dieta) y puede usar herramientas que llaman a `servicios`, igual que los
+comandos: adaptar la semana, configurar la semana tipo, editar la rutina de gimnasio, registrar
+series, peso, grasa, entrenos y tests, sincronizar el Garmin y cambiar platos del menú.
 
 Es opcional y best-effort: sin `ANTHROPIC_API_KEY` o si la API falla, devuelve un mensaje
 y el bot sigue funcionando (/sensaciones tiene reglas sin IA).
 """
 import logging
+import shlex
 from datetime import datetime, timedelta
 
 import db
+import entrenador
 import menu
 import nutricion
 import plan
@@ -103,7 +106,77 @@ HERRAMIENTAS = [
      "input_schema": {"type": "object", "properties": {
          "dia": _DIA, "comida": {"type": "string", "enum": list(menu.COMIDAS)},
          "plato": {"type": "string"}}, "required": ["dia", "comida", "plato"]}},
+    {"name": "ver_semana_config",
+     "description": "Semana tipo del atleta: qué lleva cada día (gimnasio y grupo, carrera, "
+                    "natación, bici o descanso).",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "configurar_dia",
+     "description": "Cambia de forma permanente qué lleva un día de la semana tipo. `items`: "
+                    "tipos separados por '+': carrera, natacion, bici, descanso o gym:grupo "
+                    "(pecho, espalda, pierna, hombro o un grupo propio). Ej: 'carrera+gym:hombro'. "
+                    "Para cambios puntuales de esta semana usa cambiar_sesion o mover_sesion.",
+     "input_schema": {"type": "object", "properties": {
+         "dia_semana": {"type": "string", "description": "lunes…domingo"},
+         "items": {"type": "string"}}, "required": ["dia_semana", "items"]}},
+    {"name": "ver_rutina",
+     "description": "Rutina de gimnasio del atleta con el número (#id) de cada ejercicio, "
+                    "series, repeticiones y peso objetivo.",
+     "input_schema": {"type": "object", "properties": {
+         "grupo": {"type": "string", "description": "Opcional: pecho, pierna, torso…"}}}},
+    {"name": "anadir_ejercicio",
+     "description": "Añade un ejercicio a la rutina de un grupo.",
+     "input_schema": {"type": "object", "properties": {
+         "grupo": {"type": "string"}, "nombre": {"type": "string"},
+         "series": {"type": "integer"}, "reps_min": {"type": "integer"},
+         "reps_max": {"type": "integer"}, "peso_kg": {"type": "number"},
+         "variante": {"type": "string", "enum": ["A", "B", "AB"]},
+         "descanso_s": {"type": "integer"}},
+         "required": ["grupo", "nombre", "series", "reps_min"]}},
+    {"name": "editar_ejercicio",
+     "description": "Cambia un ejercicio de la rutina (usa el #id de ver_rutina). Solo pasa lo "
+                    "que cambie.",
+     "input_schema": {"type": "object", "properties": {
+         "id": {"type": "integer"}, "series": {"type": "integer"},
+         "reps_min": {"type": "integer"}, "reps_max": {"type": "integer"},
+         "peso_kg": {"type": "number"}, "descanso_s": {"type": "integer"},
+         "nombre": {"type": "string"}, "nota": {"type": "string"}}, "required": ["id"]}},
+    {"name": "registrar_series",
+     "description": "Apunta las series hechas hoy de un ejercicio de la rutina y aplica la "
+                    "progresión de peso.",
+     "input_schema": {"type": "object", "properties": {
+         "id": {"type": "integer"},
+         "series": {"type": "array", "items": {"type": "object", "properties": {
+             "peso_kg": {"type": "number"}, "reps": {"type": "integer"}},
+             "required": ["reps"]}}}, "required": ["id", "series"]}},
+    {"name": "ver_actividades",
+     "description": "Últimas actividades del reloj Garmin con su análisis frente al plan.",
+     "input_schema": {"type": "object", "properties": {"n": {"type": "integer"}}}},
+    {"name": "ver_bienestar",
+     "description": "Training Readiness, HRV, sueño y Body Battery de los últimos 7 días.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "sincronizar_garmin",
+     "description": "Baja ya las actividades nuevas del Garmin y devuelve su análisis.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "enviar_reloj",
+     "description": "Manda al calendario del reloj los entrenos de los próximos días (tras "
+                    "cambiar el plan o la rutina).",
+     "input_schema": {"type": "object", "properties": {}}},
 ]
+
+
+def _spec(a: dict) -> list[str]:
+    """Campos de un ejercicio en la sintaxis de /rutina_add y /rutina_edit."""
+    out = []
+    if a.get("series") and a.get("reps_min") is not None:
+        rmax = a.get("reps_max") or a["reps_min"]
+        out.append(f"{a['series']}x{a['reps_min']}" + (f"-{rmax}" if rmax != a["reps_min"] else ""))
+    if a.get("peso_kg"):
+        out.append(f"{a['peso_kg']:g}kg")
+    if a.get("variante"):
+        out.append(a["variante"])
+    if a.get("descanso_s"):
+        out.append(f"{a['descanso_s']}s")
+    return out
 
 
 async def _ejecutar(chat_id: int, nombre: str, a: dict) -> str:
@@ -146,6 +219,42 @@ async def _ejecutar(chat_id: int, nombre: str, a: dict) -> str:
         return servicios.platos_disponibles(a["comida"])
     if nombre == "cambiar_plato":
         return servicios.cambiar_plato(chat_id, a.get("dia"), a["comida"], a["plato"])
+    if nombre == "ver_semana_config":
+        return servicios.semana_config_texto(chat_id)
+    if nombre == "configurar_dia":
+        return servicios.configurar_dia(chat_id, a["dia_semana"], a["items"])
+    if nombre == "ver_rutina":
+        return servicios.rutina_texto(chat_id, a.get("grupo"))
+    if nombre == "anadir_ejercicio":
+        return servicios.anadir_ejercicio(chat_id, shlex.join([a["grupo"], a["nombre"], *_spec(a)]))
+    if nombre == "editar_ejercicio":
+        if any(a.get(k) for k in ("series", "reps_min", "reps_max")):
+            fila = db.ejercicio(chat_id, a["id"])
+            if fila:
+                previo = {"series": fila["series"], "reps_min": fila["reps_min"],
+                          "reps_max": fila["reps_max"]}
+                a = {**previo, **{k: v for k, v in a.items() if v is not None}}
+        tok = [str(a["id"]), *_spec(a)]
+        if a.get("nombre"):
+            servicios.editar_ejercicio(chat_id, shlex.join([*tok, "nombre", a["nombre"]]))
+            tok = [str(a["id"])]
+        if a.get("nota") is not None:
+            tok += ["nota", a["nota"]]
+        if len(tok) == 1:
+            return servicios.rutina_texto(chat_id)
+        return servicios.editar_ejercicio(chat_id, shlex.join(tok))
+    if nombre == "registrar_series":
+        partes = [f"{x['peso_kg']:g}x{x['reps']}" if x.get("peso_kg") else str(x["reps"])
+                  for x in a["series"]]
+        return servicios.registrar_series(chat_id, shlex.join([str(a["id"]), *partes]))
+    if nombre == "ver_actividades":
+        return servicios.actividades_texto(chat_id, min(int(a.get("n") or 5), 10))
+    if nombre == "ver_bienestar":
+        return servicios.bienestar_texto(chat_id)
+    if nombre == "sincronizar_garmin":
+        return "\n\n".join(await servicios.sync_garmin(chat_id)) or "Sin actividades nuevas."
+    if nombre == "enviar_reloj":
+        return "\n".join(await servicios.enviar_reloj(chat_id)) or "El reloj ya estaba al día."
     raise servicios.ErrorUsuario(f"Herramienta desconocida: {nombre}")
 
 
@@ -164,7 +273,25 @@ def _contexto(chat_id: int) -> str:
     o = servicios.objetivo(chat_id, h)
     semana = (servicios.resumen_semana(chat_id, wn) if wn >= 1 else
               f"El plan empieza el {plan.PLAN_START.isoformat()}.")
-    test, km = plan.proximo_test(h)
+    est = servicios.estructura(chat_id)
+    pt = plan.proximo_test(h, est)
+    test_txt = (f"Próximo test: {pt[1]} km el {pt[0].isoformat()}." if pt else
+                "No hay día de carrera en su semana tipo: no hay tests.")
+    dias_txt = "\n".join(
+        f"- {plan.DIAS[i]}: " + " + ".join(f"gimnasio {g}" if t == "gym" else plan.TIPOS[t].lower()
+                                           for t, g in est.items(i)) for i in range(7))
+    con_rutina = ", ".join(est.rutinas) or "ninguno (usa la rutina por defecto)"
+    garmin_txt = "No conectado."
+    if servicios.garmin_activo(chat_id):
+        acts = db.actividades(chat_id, h - timedelta(days=7), 6)
+        lineas = [f"- {x['fecha']} {x['tipo']}: {x.get('nombre') or ''} "
+                  f"{(x.get('distancia_m') or 0) / 1000:.1f} km, "
+                  f"{round((x.get('duracion_s') or 0) / 60)}'"
+                  + (f", FC {round(x['fc_media'])}" if x.get("fc_media") else "") for x in acts]
+        b = db.bienestar(chat_id, h)
+        garmin_txt = ("Actividades de los últimos 7 días:\n" + ("\n".join(lineas) or "- ninguna")
+                      + "\nEstado de forma de hoy: "
+                      + (entrenador.texto_bienestar(dict(b)).removeprefix("⌚ ") if b else "sin datos"))
     return f"""Hoy es {servicios.nombre(h).lower()} {h.isoformat()} (hora {datetime.now(servicios.TZ):%H:%M}).
 
 ATLETA
@@ -174,9 +301,15 @@ ATLETA
 - Mejor marca: media maratón a {ATHLETE['marca_media']}. Ritmo de media actual estimado: {plan.pace(ref)} /km ({fuente}).
 - Toma creatina y whey. Come: pollo, salchichas de pollo, pavo, ternera picada, solomillo de cerdo; pescado (pota, salmón, merluza congelados) por la noche o el finde; arroz, pasta, patata, boniato, noodles, tortillas de fajita; legumbre de bote una vez por semana; kiwi, plátano y manzana; canónigos, tomate, zanahoria, cebolla y pimientos.
 
-PLAN (cíclico, bloques de 8 semanas: 3 de carga + 1 de descarga, dos veces; test de 5/10 km el sábado de la semana 8)
-- L pecho+tríceps · M espalda+bíceps · X pierna · J natación · V descanso flexible · S carrera (la única de la semana, la sesión clave) + hombro y core · D bici.
-- Próximo test: {km} km el {test.isoformat()}.
+PLAN (cíclico, bloques de 8 semanas: 3 de carga + 1 de descarga, dos veces; test de 5/10 km en el primer día de carrera de la semana 8)
+Semana tipo (la configura el atleta):
+{dias_txt}
+- La primera carrera de la semana es la sesión clave (larga, calidad o test); las demás son rodajes.
+- Grupos con rutina propia (pesos y repeticiones suyos): {con_rutina}.
+- {test_txt}
+
+GARMIN FORERUNNER 265
+{garmin_txt}
 
 SEMANA ACTUAL
 {semana}
@@ -194,7 +327,10 @@ INSTRUCCIONES = """Eres el entrenador personal y nutricionista de un atleta popu
 Cómo actuar:
 - Si cuenta cansancio, mal sueño, estrés, molestias o dolor: primero registrar_sensaciones y después adapta la sesión con cambiar_sesion o mover_sesion SIN pedir confirmación. Luego explica en 1-2 frases qué has cambiado y por qué.
 - Molestias en piernas → sesiones sin impacto (natación o bici suave) o descanso. Molestias en hombro o espalda → bici o carrera; evita gimnasio de tren superior y natación. Fatiga general o enfermedad → descanso.
-- La carrera del sábado es la sesión más importante: si se pierde, intenta recuperarla el viernes (descanso flexible) con mover_sesion. Deja al menos 48 h entre pierna y carrera.
+- La carrera principal de la semana es la sesión más importante: si se pierde, intenta recuperarla en un día de descanso con mover_sesion. Deja al menos 48 h entre pierna y carrera.
+- Si cambia su semana de forma permanente («ahora corro martes y sábado»), usa configurar_dia; para algo puntual de esta semana, cambiar_sesion o mover_sesion.
+- Rutina de gimnasio: consulta ver_rutina para los #id. Si te cuenta lo que ha levantado («press banca 80 kg 8, 8 y 7»), regístralo con registrar_series; la progresión de peso es automática. Si quiere cambiar ejercicios o pesos, editar_ejercicio o anadir_ejercicio.
+- Garmin: tienes sus actividades y su estado de forma en el contexto; para más detalle usa ver_actividades y ver_bienestar. Apóyate en ellos (readiness, HRV, sueño, ritmos y pulso reales) para adaptar el plan. Tras cambiar plan o rutina, si Garmin está conectado, usa enviar_reloj.
 - Ante dolor agudo, punzante, con hinchazón o que dura más de una semana: descanso de esa zona y recomienda ir al fisio o al médico. No diagnostiques.
 - Solo se pueden cambiar días de hoy en adelante dentro de la semana actual (lunes a domingo).
 - Si te da un peso, % de grasa, un entreno hecho o el tiempo de un test, regístralo con su herramienta.
@@ -261,3 +397,22 @@ async def responder(chat_id: int, texto: str) -> str:
     db.guardar_mensajes(chat_id, [("user", texto), ("assistant", respuesta)],
                         datetime.now(servicios.TZ).isoformat(timespec="seconds"))
     return respuesta
+
+
+async def comentar_actividad(chat_id: int, analisis: str) -> str:
+    """Comentario breve del coach sobre una actividad recién sincronizada ("" si no hay IA)."""
+    if not activo() or db.sumar_uso_coach(chat_id, servicios.hoy()) > CLAUDE_MAX_MENSAJES_DIA:
+        return ""
+    try:
+        r = await _api().messages.create(
+            model=CLAUDE_MODEL, max_tokens=400,
+            system=INSTRUCCIONES + "\n\n" + _contexto(chat_id),
+            messages=[{"role": "user", "content":
+                       "Acabo de terminar esta actividad (análisis automático del bot):\n\n"
+                       f"{analisis}\n\nComéntala como mi entrenador en 2-4 frases: qué tal ha "
+                       "ido frente al plan y qué hago hoy y mañana (recuperación, comida). No "
+                       "repitas los números que ya tengo."}])
+        return "🧑‍🏫 " + _texto(r.content) if _texto(r.content) else ""
+    except Exception as e:  # noqa: BLE001
+        log.warning("Coach: no pude comentar la actividad: %s", e)
+        return ""

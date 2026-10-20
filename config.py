@@ -53,6 +53,26 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
 # Tope de mensajes al día por chat para controlar el gasto
 CLAUDE_MAX_MENSAJES_DIA = int(os.getenv("CLAUDE_MAX_MENSAJES_DIA", "40"))
 
+# --- Garmin Connect (opcional, librería no oficial garminconnect) ---
+# Primer login (con MFA si lo tienes): `.venv/bin/python garmin_login.py`, que guarda los tokens
+# en GARMIN_TOKENS_DIR. El bot solo usa esos tokens (y los refresca solo).
+GARMIN_EMAIL = os.getenv("GARMIN_EMAIL", "")
+GARMIN_PASSWORD = os.getenv("GARMIN_PASSWORD", "")
+GARMIN_TOKENS_DIR = os.path.expanduser(os.getenv("GARMIN_TOKENS_DIR", "~/.garminconnect"))
+# Chat de Telegram al que pertenece la cuenta de Garmin (0 = Garmin desactivado)
+GARMIN_CHAT_ID = int(os.getenv("GARMIN_CHAT_ID", "0") or 0)
+# Cada cuántos minutos se buscan actividades nuevas
+GARMIN_SYNC_MIN = int(os.getenv("GARMIN_SYNC_MIN", "15"))
+# Enviar las sesiones al calendario de Garmin (y al reloj) y cuántos días vista
+GARMIN_ENVIAR = os.getenv("GARMIN_ENVIAR", "1") == "1"
+GARMIN_DIAS_ENVIO = int(os.getenv("GARMIN_DIAS_ENVIO", "7"))
+# Ajustes automáticos: pesos de la rutina y sesión del día según Readiness/HRV/sueño
+GARMIN_AJUSTES = os.getenv("GARMIN_AJUSTES", "1") == "1"
+# Usar la predicción de media de Garmin para los ritmos cuando no hay un test reciente
+GARMIN_USAR_PREDICCION = os.getenv("GARMIN_USAR_PREDICCION", "1") == "1"
+# Un test vale para los ritmos durante estos días; después manda la predicción de Garmin
+TEST_VIGENCIA_DIAS = int(os.getenv("TEST_VIGENCIA_DIAS", "70"))
+
 # Perfil del atleta
 ATHLETE = {
     "nombre": "Alberto",
